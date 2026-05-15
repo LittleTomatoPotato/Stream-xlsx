@@ -186,6 +186,7 @@ impl XlsxStreamReader {
                     Some((pos, None, true))
                 }
                 Ok(Event::End(e)) if e.local_name().as_ref() == b"sheetData" => {
+                    self.in_sheet_data = false;
                     return Ok(None);
                 }
                 Ok(Event::Eof) => return Err(anyhow!("Unexpected EOF in sheetData")),

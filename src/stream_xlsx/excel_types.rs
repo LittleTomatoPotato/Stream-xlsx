@@ -21,6 +21,18 @@ impl<T> Cell<T> {
     pub fn get_value(&self) -> &T {
         &self.val
     }
+    pub fn into_value(self) -> T {
+        self.val
+    }
+}
+
+impl<T> From<Cell<T>> for String
+where
+    T: Into<String>,
+{
+    fn from(value: Cell<T>) -> Self {
+        value.into_value().into()
+    }
 }
 
 /// Excel 单元格数据类型（完全独立）
@@ -50,6 +62,21 @@ impl fmt::Display for Data {
             Data::DurationIso(e) => write!(f, "{e}"),
             Data::Error(e) => write!(f, "{e}"),
             Data::Empty => Ok(()),
+        }
+    }
+}
+
+impl From<Data> for String {
+    fn from(data: Data) -> String {
+        match data {
+            Data::String(s) => s, // 直接移出，零分配
+            Data::Int(i) => i.to_string(),
+            Data::Float(f) => f.to_string(),
+            Data::Bool(b) => b.to_string(),
+            Data::DateTime(dt) => dt.to_string(),
+            Data::DateTimeIso(s) | Data::DurationIso(s) => s, // 同样移出
+            Data::Error(e) => e.to_string(),
+            Data::Empty => String::new(),
         }
     }
 }

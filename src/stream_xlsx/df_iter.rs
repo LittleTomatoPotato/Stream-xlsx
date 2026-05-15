@@ -1,6 +1,6 @@
 use crate::stream_xlsx::{
     excel_types::{Cell, Data, Dimensions},
-    xlsx_stream::XlsxStreamReader,
+    xlsx_stream_unsafe::XlsxStreamReader,
 };
 use polars::prelude::DataFrame;
 use polars::{
@@ -10,7 +10,7 @@ use polars::{
     prelude::NamedFrom,
     series::Series,
 };
-use std::path::Path;
+use std::{path::Path, usize};
 
 // 流式读取所需要的列
 #[derive(Debug)]
@@ -25,22 +25,13 @@ impl<T: FromData> Col<T> {
         Self { y, vec: Vec::new() }
     }
 
-    pub fn push_cell(&mut self, cell: Cell<Data>) -> anyhow::Result<()> {
-        let (cell_x, cell_y) = cell.get_position();
-        if cell_y as usize != self.y {
-            return Err(anyhow::anyhow!(
-                "列序号错误: 期望 {}, 实际 {}",
-                self.y,
-                cell_y
-            ));
-        }
-        let empty_num = (cell_x as usize).saturating_sub(self.vec.len());
+    pub fn push_cell(&mut self, cell: Cell<Data>, batch_row: usize) {
+        let empty_num = (batch_row).saturating_sub(self.vec.len());
         if empty_num > 0 {
             self.vec
                 .extend(std::iter::repeat_with(|| T::from_data(&Data::Empty)).take(empty_num));
         }
         self.vec.push(T::from_data(cell.get_value()));
-        Ok(())
     }
 }
 
@@ -123,11 +114,10 @@ impl<'a> FromDataRef<'a> for AnyValue<'a> {
 #[derive(Debug)]
 pub struct Cols<T> {
     pub vecs: Vec<Col<T>>,
-    pub max_x: usize,
+    pub batch_size: usize,
     pub cell_cache: Option<Cell<Data>>,
     pub col_num: usize,
     pub headers: Vec<String>,
-    pub first_batch_done: bool,
 }
 
 impl<T> Cols<T>
@@ -135,29 +125,23 @@ where
     T: FromData,
 {
     pub fn new(dimension: &Dimensions, batch_size: usize) -> Self {
-        let col_num = dimension.end.1 as usize;
-        let bs = batch_size.min(dimension.end.0 as usize);
-        let mut vecs: Vec<Col<T>> = Vec::with_capacity(bs);
+        let col_num = dimension.end.1 as usize + 1;
+        let mut vecs: Vec<Col<T>> = Vec::with_capacity(col_num);
         for i in 0..=col_num {
             vecs.push(Col::new(i));
         }
         Self {
             vecs,
-            max_x: 0,
+            batch_size,
             cell_cache: None,
             col_num: col_num,
             headers: Vec::with_capacity(col_num),
-            first_batch_done: false,
         }
     }
 
-    pub fn push_cell(&mut self, cell: Cell<Data>) -> anyhow::Result<()> {
-        let (x, y) = cell.get_position();
-        let x = x as usize;
+    pub fn push_cell(&mut self, cell: Cell<Data>, batch_row: usize) -> anyhow::Result<()> {
+        let (_, y) = cell.get_position();
         let y = y as usize;
-        if x > self.max_x {
-            self.max_x = x;
-        }
         if y >= self.vecs.len() {
             let start = self.vecs.len();
             for i in start..=y {
@@ -168,31 +152,14 @@ where
             .vecs
             .get_mut(y)
             .ok_or_else(|| anyhow::anyhow!("列 {} 超出预定义范围", y))?;
-        col.push_cell(cell)
+        col.push_cell(cell, batch_row);
+        Ok(())
     }
-
-    pub fn clean_for_iter(&self) {}
 }
 
 impl Cols<AnyValue<'static>> {
-    pub fn into_dataframe(&mut self, has_header: bool) -> PolarsResult<DataFrame> {
+    pub fn into_dataframe(&mut self) -> PolarsResult<DataFrame> {
         let max_len = self.vecs.iter().map(|c| c.vec.len()).max().unwrap_or(0);
-        let is_first_batch = !self.first_batch_done;
-        if is_first_batch {
-            for i in 0..self.col_num {
-                let header = if has_header && !self.vecs[i].vec.is_empty() {
-                    match &self.vecs[i].vec[0] {
-                        AnyValue::String(s) => s.to_string(),
-                        AnyValue::StringOwned(s) => s.to_string(),
-                        other => format!("{}", other),
-                    }
-                } else {
-                    format!("col_{}", i)
-                };
-                self.headers.push(header);
-            }
-            self.first_batch_done = true;
-        }
         let old_vecs = std::mem::replace(
             &mut self.vecs,
             (0..self.col_num).map(|i| Col::new(i)).collect(),
@@ -205,11 +172,7 @@ impl Cols<AnyValue<'static>> {
                     col.vec.resize(max_len, AnyValue::Null);
                 }
                 let name = self.headers.get(i).map(|s| s.as_str()).unwrap_or("unknown");
-                let values = if is_first_batch && has_header {
-                    &col.vec[1..]
-                } else {
-                    &col.vec[..]
-                };
+                let values = &col.vec[..];
 
                 Series::new(name.into(), values).into()
             })
@@ -226,21 +189,94 @@ pub struct DataFrameIter {
     reader: XlsxStreamReader,
     cols: Cols<polars::prelude::AnyValue<'static>>,
     cell_cache: Option<Cell<Data>>,
+    has_header: bool,
+    len: usize,                      // 总批次数
+    batch_start_row: Option<u32>,    // 当前批次的起始绝对行号
+    current_row_count: usize,        // 当前批次已收集的行数（用于批次截断）
+    last_processed_row: Option<u32>, // 上一个处理的绝对行号（检测行切换)
 }
 
 impl DataFrameIter {
-    pub fn new<P>(batch_size: usize, path: P, sheet_name: &str) -> anyhow::Result<Self>
+    pub fn new<P>(
+        batch_size: usize,
+        path: P,
+        sheet_name: &str,
+        has_header: bool,
+    ) -> anyhow::Result<Self>
     where
         P: AsRef<Path>,
     {
         let reader = XlsxStreamReader::new(path, sheet_name)?;
         let dim = reader.dimensions();
         let cols = Cols::new(&dim, batch_size);
-        Ok(Self {
+        let mut iter = Self {
             reader,
             cols,
             cell_cache: None,
-        })
+            has_header,
+            len: 0,
+            batch_start_row: None,
+            current_row_count: 0,
+            last_processed_row: None,
+        };
+        iter.find_header(batch_size);
+
+        Ok(iter)
+    }
+
+    fn find_header(&mut self, batch_size: usize) {
+        // 应该寻找第一个非空行
+        let first_cell = match self.reader.next_cell().ok().flatten() {
+            Some(cell) => cell,
+            None => {
+                self.cols
+                    .vecs
+                    .iter()
+                    .enumerate()
+                    .for_each(|(i, _)| self.cols.headers.push(format!("col_{}", i)));
+                self.len = 0;
+                return;
+            }
+        };
+        let first_x = first_cell.get_position().0;
+        let total_rows: usize; // 计算迭代器长度
+        if self.has_header {
+            // 将非空的第一行放入header中
+            self.cols.headers.push(first_cell.into());
+            while let Some(cell) = self.reader.next_cell().ok().flatten() {
+                let x = cell.get_position().0;
+                if x == first_x {
+                    self.cols.headers.push(cell.into());
+                } else {
+                    self.cell_cache = Some(cell);
+                    break;
+                }
+            }
+
+            total_rows = (self.reader.dimensions().end.0 - first_x) as usize;
+        } else {
+            self.cell_cache = Some(first_cell);
+            self.cols
+                .vecs
+                .iter()
+                .enumerate()
+                .for_each(|(i, _)| self.cols.headers.push(format!("col_{}", i)));
+            total_rows = (self.reader.dimensions().end.0 - first_x + 1) as usize;
+        }
+        self.len = (total_rows + batch_size - 1) / batch_size;
+    }
+
+    fn finsh_batch(&mut self) -> Option<DataFrame> {
+        let has_data = self.cols.vecs.iter().any(|c| !c.vec.is_empty());
+        if !has_data {
+            return None;
+        }
+        let df = self.cols.into_dataframe().ok();
+        // 重置状态，准备下一批
+        self.batch_start_row = None;
+        self.current_row_count = 0;
+        self.last_processed_row = None;
+        df
     }
 }
 
@@ -249,30 +285,52 @@ impl Iterator for DataFrameIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(cell) = self.cell_cache.take() {
-            if let Err(e) = self.cols.push_cell(cell) {
-                eprintln!("push cached cell failed: {e}");
-                return None;
+            let cell_x = cell.get_position().0;
+            self.batch_start_row = Some(cell_x);
+            self.current_row_count = 1;
+            self.last_processed_row = Some(cell_x);
+            self.cols.push_cell(cell, 0).ok()?;
+        } else if self.batch_start_row.is_none() {
+            match self.reader.next_cell().ok().flatten() {
+                Some(cell) => {
+                    let cell_x = cell.get_position().0;
+                    self.batch_start_row = Some(cell_x);
+                    self.current_row_count = 1;
+                    self.last_processed_row = Some(cell_x);
+                    self.cols.push_cell(cell, 0).ok()?;
+                }
+                None => {
+                    return None;
+                }
             }
         }
 
         loop {
             match self.reader.next_cell() {
                 Ok(Some(cell)) => {
-                    let cell_x = cell.get_position().0;
-                    if cell_x as usize > self.cols.max_x {
-                        self.cell_cache = Some(cell);
-                        return self.cols.into_dataframe(true).ok();
+                    let current_row = cell.get_position().0;
+
+                    // 检测行切换
+                    if self.last_processed_row.map_or(true, |lr| lr != current_row) {
+                        // 新的一行：先检查是否已经达到批次大小
+                        if self.current_row_count >= self.cols.batch_size {
+                            // 缓存当前单元格，返回当前批次
+                            self.cell_cache = Some(cell);
+                            return self.finsh_batch();
+                        }
+                        // 未达批次，进入新行
+                        self.current_row_count += 1;
+                        self.last_processed_row = Some(current_row);
                     }
-                    if let Err(e) = self.cols.push_cell(cell) {
-                        eprintln!("push cell failed: {e}");
-                        return None;
-                    }
-                    self.cols.clean_for_iter();
+
+                    let batch_row = (current_row - self.batch_start_row.unwrap()) as usize;
+                    // 正常推入单元格
+                    self.cols.push_cell(cell, batch_row).ok()?;
                 }
                 Ok(None) => {
                     let has_data = self.cols.vecs.iter().any(|c| !c.vec.is_empty());
                     if has_data {
-                        return self.cols.into_dataframe(true).ok();
+                        return self.cols.into_dataframe().ok();
                     }
                     return None;
                 }
@@ -286,11 +344,16 @@ impl Iterator for DataFrameIter {
 }
 
 /// 便捷函数：直接返回一个 DataFrame 迭代器
-pub fn df_iter<P>(batch_size: usize, path: P, sheet_name: &str) -> anyhow::Result<DataFrameIter>
+pub fn df_iter<P>(
+    batch_size: usize,
+    path: P,
+    sheet_name: &str,
+    has_header: bool,
+) -> anyhow::Result<DataFrameIter>
 where
     P: AsRef<Path>,
 {
-    DataFrameIter::new(batch_size, path, sheet_name)
+    DataFrameIter::new(batch_size, path, sheet_name, has_header)
 }
 
 #[cfg(test)]
@@ -299,10 +362,13 @@ mod tests {
 
     #[test]
     fn test_df_iter() -> anyhow::Result<()> {
-        let iter = df_iter(10, "test_data.xlsx", "Sheet1")?;
+        let iter = df_iter(10, "test_data.xlsx", "Sheet1", true)?;
         let mut total_rows = 0;
         for (i, df) in iter.enumerate() {
-            println!("batch {}: shape {:?}", i, df.shape());
+            if i <= 5 {
+                println!("batch {}: shape {:?}", i, df.shape());
+                println!("{}", df)
+            }
             total_rows += df.height();
         }
         println!("total rows: {}", total_rows);

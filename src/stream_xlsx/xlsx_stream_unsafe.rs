@@ -1,5 +1,7 @@
+/// 默认采用64KB作为内存切片的默认值, 后续可以考虑添加一个新的后台线程读取前N的块,记录最大值
 use crate::stream_xlsx::excel_types::{Cell, CellErrorType, Data, Dimensions};
 use anyhow::{Context, Result, anyhow};
+use bytes::{Bytes, BytesMut};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 use std::collections::HashMap;
@@ -7,17 +9,17 @@ use std::io::{BufReader, Cursor, Read, Seek};
 use std::path::Path;
 use zip::ZipArchive;
 
-const CHUNK_SIZE: usize = 64 * 1024;
+const CHUNK_SIZE: usize = 64 * 1024; // 默认64K
 const CHANNEL_CAPACITY: usize = 4;
 
 /// 通过 channel 把后台线程的解压数据流式喂给前端 Reader。
 struct ChannelReader {
-    rx: std::sync::mpsc::Receiver<Vec<u8>>,
-    current: Option<std::io::Cursor<Vec<u8>>>,
+    rx: std::sync::mpsc::Receiver<Bytes>,
+    current: Option<std::io::Cursor<Bytes>>,
 }
 
 impl ChannelReader {
-    fn new(rx: std::sync::mpsc::Receiver<Vec<u8>>) -> Self {
+    fn new(rx: std::sync::mpsc::Receiver<Bytes>) -> Self {
         Self { rx, current: None }
     }
 }
@@ -56,6 +58,7 @@ pub struct XlsxStreamReader {
     cell_buf: Vec<u8>,
     dimensions: Dimensions,
     in_sheet_data: bool,
+    scratch_buf: Vec<u8>,
 }
 
 impl XlsxStreamReader {
@@ -64,23 +67,36 @@ impl XlsxStreamReader {
 
         let (strings, sheet_path) = Self::prepare(&path, sheet_name)?;
 
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(CHANNEL_CAPACITY);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Bytes>(CHANNEL_CAPACITY);
         std::thread::spawn(move || {
             let send_result = (|| -> Result<()> {
                 let file = std::fs::File::open(&path)?;
                 let reader = BufReader::new(file);
                 let mut archive = ZipArchive::new(reader)?;
                 let mut zip_file = archive.by_name(&sheet_path)?;
-                let mut buf = vec![0u8; CHUNK_SIZE];
+                let mut buf = BytesMut::with_capacity(CHUNK_SIZE);
+                // let mut sizes: Vec<usize> = Vec::new();
                 loop {
-                    match zip_file.read(&mut buf) {
+                    buf.reserve(CHUNK_SIZE);
+                    let spare = buf.spare_capacity_mut();
+                    let dst = unsafe {
+                        std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len())
+                    };
+                    match zip_file.read(dst) {
                         Ok(0) => break,
                         Ok(n) => {
-                            if tx.send(buf[..n].to_vec()).is_err() {
+                            // sizes.push(n);
+                            unsafe {
+                                buf.set_len(buf.len() + n);
+                            }
+                            let chunk = buf.split_to(n).freeze();
+                            if tx.send(chunk).is_err() {
                                 break;
                             }
                         }
-                        Err(_) => break,
+                        Err(e) => {
+                            return Err(e.into());
+                        }
                     }
                 }
                 Ok(())
@@ -121,6 +137,8 @@ impl XlsxStreamReader {
             }
         }
 
+        let scratch_buf: Vec<u8> = Vec::new();
+
         Ok(Self {
             xml,
             strings,
@@ -130,6 +148,7 @@ impl XlsxStreamReader {
             cell_buf: Vec::with_capacity(1024),
             dimensions,
             in_sheet_data,
+            scratch_buf,
         })
     }
 
@@ -377,15 +396,9 @@ impl XlsxStreamReader {
     }
 
     fn parse_a1(s: &str) -> Result<(u32, u32)> {
-        let mut col_str = String::new();
-        let mut row_str = String::new();
-        for c in s.chars() {
-            if c.is_ascii_alphabetic() {
-                col_str.push(c);
-            } else {
-                row_str.push(c);
-            }
-        }
+        let idx = s.find(|c: char| c.is_ascii_digit()).unwrap_or(s.len());
+        let col_str = &s[..idx];
+        let row_str = &s[idx..];
         let row = row_str.parse::<u32>()?.saturating_sub(1);
         let mut col = 0u32;
         for c in col_str.chars() {
@@ -462,8 +475,8 @@ impl XlsxStreamReader {
     fn read_text_content(&mut self, end_tag: &[u8]) -> Result<String> {
         let mut text = String::new();
         loop {
-            let mut buf = Vec::new();
-            match self.xml.read_event_into(&mut buf) {
+            self.scratch_buf.clear();
+            match self.xml.read_event_into(&mut self.scratch_buf) {
                 Ok(Event::Text(t)) => {
                     text.push_str(&t.xml10_content().unwrap_or_default());
                 }
@@ -521,9 +534,10 @@ impl XlsxStreamReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    // #[global_allocator]
+    // static ALLOC: dhat::Alloc = dhat::Alloc;
     #[test]
-    fn test_stream_reader() -> Result<()> {
+    fn test_stream_reader_unsafe() -> Result<()> {
         // let _profile = dhat::Profiler::new_heap();
         let start = std::time::Instant::now();
         let mut reader = XlsxStreamReader::new("test_data.xlsx", "Sheet1")?;

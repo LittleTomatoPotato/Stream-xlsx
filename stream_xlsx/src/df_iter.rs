@@ -4,7 +4,7 @@ use crate::{
 };
 use polars::prelude::DataFrame;
 use polars::{
-    datatypes::{AnyValue, PlSmallStr, TimeUnit},
+    datatypes::{AnyValue, DataType, PlSmallStr, TimeUnit},
     error::PolarsResult,
     frame::column::Column,
     prelude::NamedFrom,
@@ -81,6 +81,7 @@ pub struct Cols<T> {
     pub batch_size: usize,
     pub col_num: usize,
     pub headers: Vec<String>,
+    pub col_dtypes: Vec<Option<DataType>>,
 }
 
 impl<T> Cols<T>
@@ -96,8 +97,9 @@ where
         Self {
             vecs,
             batch_size,
-            col_num: col_num,
+            col_num,
             headers: Vec::with_capacity(col_num),
+            col_dtypes: vec![None; col_num],
         }
     }
 
@@ -108,14 +110,39 @@ where
             let start = self.vecs.len();
             for i in start..=y {
                 self.vecs.push(Col::new(i, self.batch_size));
+                self.col_dtypes.push(None);
             }
         }
+        // 边写边推断类型（必须在 get_mut 之前，避免重复可变借用）
+        self.infer_dtype(y, cell.get_value());
         let col = self
             .vecs
             .get_mut(y)
             .ok_or_else(|| anyhow::anyhow!("列 {} 超出预定义范围", y))?;
         col.push_cell(cell.into_value(), batch_row);
         Ok(())
+    }
+
+    fn infer_dtype(&mut self, col_idx: usize, data: &Data) {
+        if matches!(data, Data::Empty | Data::Error(_)) {
+            return;
+        }
+        let new_dtype = match data {
+            Data::Int(_) => DataType::Int64,
+            Data::Float(_) => DataType::Float64,
+            Data::Bool(_) => DataType::Boolean,
+            Data::String(_) | Data::DateTimeIso(_) | Data::DurationIso(_) => DataType::String,
+            Data::DateTime(_) => DataType::Datetime(TimeUnit::Nanoseconds, None),
+            _ => DataType::Null,
+        };
+        let current = &mut self.col_dtypes[col_idx];
+        *current = match (current.take(), new_dtype) {
+            (None, dt) => Some(dt),
+            (Some(DataType::Int64), DataType::Float64)
+            | (Some(DataType::Float64), DataType::Int64) => Some(DataType::Float64),
+            (Some(dt1), dt2) if dt1 == dt2 => Some(dt1),
+            _ => Some(DataType::String),
+        };
     }
 }
 
@@ -139,9 +166,14 @@ impl Cols<AnyValue<'static>> {
                 let name = self.headers.get(i).map(|s| s.as_str()).unwrap_or("unknown");
                 let values = &col.vec[..];
 
-                Series::new(name.into(), values).into()
+                let series = if let Some(dt) = self.col_dtypes.get(i).and_then(|d| d.as_ref()) {
+                    Series::from_any_values_and_dtype(name.into(), values, dt, false)
+                } else {
+                    Ok(Series::new(name.into(), values))
+                }?;
+                Ok::<_, polars::error::PolarsError>(series.into())
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         DataFrame::new_infer_height(columns)
     }

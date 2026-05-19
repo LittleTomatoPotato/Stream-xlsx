@@ -2,11 +2,16 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rust_xlsxwriter::{ExcelDateTime, Workbook};
 
-pub fn generate(path: &std::path::PathBuf, rows: usize) -> Result<(), Box<dyn std::error::Error>> {
+pub fn generate(
+    path: &std::path::PathBuf,
+    rows: usize,
+    col: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     let path = path.as_path();
 
     let mut workbook = Workbook::new();
     let worksheet = workbook.add_worksheet();
+    let addition_cols = col.saturating_sub(7).max(0);
 
     // 写入表头：对应 calamine 常见的 DataType 类别
     let headers = [
@@ -69,6 +74,12 @@ pub fn generate(path: &std::path::PathBuf, rows: usize) -> Result<(), Box<dyn st
             worksheet.write(r, 6, "filled")?;
         }
         // 否则该单元格保持未写入状态，即为 Empty
+
+        // 写入额外字符串列
+        for i in 0..addition_cols {
+            let str_val = format!("row_{}_rnd{}", row, rng.random::<u32>());
+            worksheet.write(r, (7 + i) as u16, &str_val)?;
+        }
     }
 
     workbook.save(path)?;
@@ -79,4 +90,15 @@ pub fn generate(path: &std::path::PathBuf, rows: usize) -> Result<(), Box<dyn st
         headers.len()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn one_test() {
+        let n = 1;
+        for i in 0..n {
+            println!("{}", i)
+        }
+    }
 }

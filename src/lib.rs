@@ -41,6 +41,10 @@ pub enum Pattern {
         path: std::path::PathBuf,
         #[arg(default_value = "100000", short = 'r', long)]
         rows: usize,
+        #[arg(default_value = "7", short = 'c', long)]
+        col: usize,
+        #[arg(short = 'l', long)]
+        no_limit: bool,
     },
     /// 生成 shell 自动补全脚本
     Completion {
@@ -67,7 +71,14 @@ impl Display for TestMod {
     }
 }
 
-pub fn test_parttern(args: &Args, path: &std::path::PathBuf, parttern: &TestMod, rows: usize) {
+pub fn test_parttern(
+    args: &Args,
+    path: &std::path::PathBuf,
+    parttern: &TestMod,
+    rows: usize,
+    col: usize,
+    no_limit: bool,
+) {
     let start = std::time::Instant::now();
 
     match parttern {
@@ -100,16 +111,32 @@ pub fn test_parttern(args: &Args, path: &std::path::PathBuf, parttern: &TestMod,
                 };
             let mut count: usize = 1;
             let total_df_num = df_iter.len();
-            df_iter.take(10).for_each(|df| match df {
-                Ok(df) => {
-                    println!("Batch {}: {}", count, df);
-                    count += 1;
-                }
-                Err(e) => {
-                    eprintln!("Batch {} error: {}", count, e);
-                    count += 1;
-                }
-            });
+            if !no_limit {
+                df_iter.take(10).for_each(|df| match df {
+                    Ok(df) => {
+                        println!("Batch {}: {}", count, df);
+                        count += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("Batch {} error: {}", count, e);
+                        count += 1;
+                    }
+                });
+            } else {
+                df_iter.for_each(|df| match df {
+                    Ok(df) => {
+                        if count < 10 {
+                            println!("Batch {}: {}", count, df);
+                        }
+                        count += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("Batch {} error: {}", count, e);
+                        count += 1;
+                    }
+                });
+            }
+
             let elapsed = start.elapsed();
             println!(
                 "Total df :{}. Debug mode show up to 10\nTotal batches: {}, elapsed: {:?}",
@@ -119,7 +146,7 @@ pub fn test_parttern(args: &Args, path: &std::path::PathBuf, parttern: &TestMod,
             );
         }
         TestMod::TestFile => {
-            match generate_test_xlsx::generate(path, rows) {
+            match generate_test_xlsx::generate(path, rows, col) {
                 Ok(_) => {
                     println!("测试文件成功生成: {:?}", path)
                 }

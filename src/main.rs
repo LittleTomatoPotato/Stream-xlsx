@@ -19,7 +19,9 @@ fn main() {
             ref parttern,
             ref path,
             ref rows,
-        } => test_parttern(&args, path, parttern, *rows),
+            ref col,
+            ref no_limit,
+        } => test_parttern(&args, path, parttern, *rows, *col, *no_limit),
         Pattern::Completion { shell } => {
             let mut cmd = Args::command();
             let name = cmd.get_name().to_string();

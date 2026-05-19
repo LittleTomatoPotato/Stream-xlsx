@@ -62,7 +62,7 @@ fn read_xlsx(
 }
 
 /// Python 模块初始化
-#[pymodule(name = "stream_xlsx")]
+#[pymodule]
 fn stream_xlsx_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<XlsxReader>()?;
     m.add_function(wrap_pyfunction!(read_xlsx, m)?)?;

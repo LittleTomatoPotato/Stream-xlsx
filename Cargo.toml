@@ -1,3 +1,8 @@
+[workspace]
+members = [".", "stream_xlsx", "stream_xlsx_py"]
+default-members = [".", "stream_xlsx"]
+resolver = "2"
+
 [package]
 name = "project_x"
 version = "0.1.0"
@@ -5,14 +10,21 @@ edition = "2024"
 
 [dependencies]
 calamine = "0.35.0"
-polars = "0.53.0"
+polars = { version = "0.53.0", features = ["csv"] }
 rust_xlsxwriter = "0.84"
 rand = "0.9"
 chrono = "0.4"
 anyhow = "1.0.102"
-zip = "2"
-quick-xml = "0.39"
-bytes = "1.11.1"
+stream_xlsx = { path = "stream_xlsx" }
+clap = { version = "4.6.1", features = ["derive"] }
+clap_complete = "4"
 
 [dev-dependencies]
 dhat = "0.3.3"
+
+[profile.release]
+opt-level = 3
+lto = "fat"           # 最大化跨 crate 优化
+codegen-units = 1
+panic = "abort"       # 不需要 unwind 时能再提升一点性能
+strip = true

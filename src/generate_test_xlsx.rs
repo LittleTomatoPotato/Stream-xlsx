@@ -1,11 +1,9 @@
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rust_xlsxwriter::{ExcelDateTime, Workbook};
-use std::path::Path;
 
-pub fn generate() -> Result<(), Box<dyn std::error::Error>> {
-    let path = Path::new("test_data.xlsx");
-    let rows = 100_000;
+pub fn generate(path: &std::path::PathBuf, rows: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let path = path.as_path();
 
     let mut workbook = Workbook::new();
     let worksheet = workbook.add_worksheet();

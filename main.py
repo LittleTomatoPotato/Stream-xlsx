@@ -7,7 +7,7 @@ def main():
     # 用我们的 Rust 流式库读取
     print("=== stream_xlsx (惰性迭代器) ===")
     reader = stream_xlsx_py.read_xlsx(
-        "target/release/test_data_1m.xslx", batch_size=100000
+        "target/release/test_data_1m.xslx", batch_size=1000000
     )
     count = 0
     for df in reader:

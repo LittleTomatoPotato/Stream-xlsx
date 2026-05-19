@@ -151,6 +151,33 @@ impl ExcelDateTime {
         self.value
     }
 
+    /// 直接返回纳秒时间戳（跳过 chrono 双重校验）
+    ///
+    /// Excel 1900 calendar 伪 epoch 为 1899-12-30（兼容 1900 闰年 bug）。
+    /// 当 days >= 61 时标准历法与 Excel 一致；days 1..=59 时 Excel 比标准快 1 天。
+    pub fn to_timestamp_nanos(&self) -> i64 {
+        const NANOS_PER_DAY: i64 = 86_400_000_000_000i64;
+
+        let days = self.value.floor() as i64;
+        let fract = self.value.fract();
+
+        // 计算自 Unix epoch (1970-01-01) 以来的天数
+        let unix_days = if self.is_1904 {
+            days + 24_107 // 1904-01-01 → 1970-01-01 = 24107 天
+        } else if days > 60 {
+            days - 25_569 // 1899-12-30 → 1970-01-01 = 25569 天
+        } else if days >= 1 {
+            days - 25_568 // 补偿 Excel 1900 闰年 bug（1..=59 快 1 天）
+        } else {
+            days - 25_569
+        };
+
+        // 时间部分：毫秒精度已足够（Excel 只存到毫秒）
+        let time_millis = (fract * 86_400_000f64).round() as i64;
+
+        unix_days * NANOS_PER_DAY + time_millis * 1_000_000
+    }
+
     pub fn to_ymd_hms_milli(&self) -> (u16, u8, u8, u8, u8, u8, u16) {
         let mut months = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 

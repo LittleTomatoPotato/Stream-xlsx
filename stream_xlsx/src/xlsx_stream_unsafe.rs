@@ -4,12 +4,12 @@ use anyhow::{Context, Result, anyhow};
 use bytes::{Bytes, BytesMut};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Cursor, Read, Seek};
 use std::path::Path;
 use zip::ZipArchive;
 
-const CHUNK_SIZE: usize = 64 * 1024; // 默认64K
+const CHUNK_SIZE: usize = 256 * 1024; // 256K
 const CHANNEL_CAPACITY: usize = 4;
 
 #[derive(Debug)]
@@ -83,6 +83,9 @@ impl Read for ChannelReader {
 pub struct XlsxStreamReader {
     xml: Reader<BufReader<ChannelReader>>,
     strings: Vec<String>,
+    cell_xfs: Vec<u32>,
+    custom_date_numfmts: HashSet<u32>,
+    date_columns: Vec<Option<bool>>,
     row_index: u32,
     col_index: u32,
     buf: Vec<u8>,
@@ -99,7 +102,8 @@ impl XlsxStreamReader {
         sheet_idx: Option<usize>,
     ) -> Result<Self> {
         let path = path.as_ref().to_owned();
-        let (strings, sheet_path) = Self::prepare(&path, sheet_name, sheet_idx)?;
+        let (strings, sheet_path, cell_xfs, custom_date_numfmts) =
+            Self::prepare(&path, sheet_name, sheet_idx)?;
 
         let (tx, rx) = std::sync::mpsc::sync_channel::<Bytes>(CHANNEL_CAPACITY);
         std::thread::spawn(move || {
@@ -176,6 +180,9 @@ impl XlsxStreamReader {
         Ok(Self {
             xml,
             strings,
+            cell_xfs,
+            custom_date_numfmts,
+            date_columns: Vec::new(),
             row_index: 0,
             col_index: 0,
             buf: Vec::with_capacity(1024),
@@ -226,17 +233,45 @@ impl XlsxStreamReader {
                     None
                 }
                 Ok(Event::Start(e)) if e.local_name().as_ref() == b"c" => {
-                    let pos = Self::parse_cell_pos(&e, self.row_index, self.col_index)?;
+                    let mut pos = None;
+                    let mut t_attr: Option<&str> = None;
+                    let mut s_attr: Option<usize> = None;
+                    for attr in e.attributes() {
+                        let attr = attr?;
+                        match attr.key.as_ref() {
+                            b"r" => {
+                                if let Ok(r_str) = std::str::from_utf8(&attr.value) {
+                                    pos = Some(Self::parse_a1(r_str)?);
+                                }
+                            }
+                            b"t" => {
+                                t_attr = match attr.value.as_ref() {
+                                    b"s" => Some("s"),
+                                    b"b" => Some("b"),
+                                    b"e" => Some("e"),
+                                    b"str" => Some("str"),
+                                    b"d" => Some("d"),
+                                    _ => None,
+                                };
+                            }
+                            b"s" => {
+                                s_attr = std::str::from_utf8(&attr.value)
+                                    .ok()
+                                    .and_then(|s| s.parse().ok());
+                            }
+                            _ => {}
+                        }
+                    }
+                    let pos = pos.unwrap_or((self.row_index, self.col_index));
                     self.row_index = pos.0;
                     self.col_index = pos.1;
-                    let t_attr = Self::get_attribute(&e, b"t")?;
-                    Some((pos, t_attr, false))
+                    Some((pos, t_attr, s_attr, false))
                 }
                 Ok(Event::Empty(e)) if e.local_name().as_ref() == b"c" => {
                     let pos = Self::parse_cell_pos(&e, self.row_index, self.col_index)?;
                     self.row_index = pos.0;
                     self.col_index = pos.1;
-                    Some((pos, None, true))
+                    Some((pos, None, None, true))
                 }
                 Ok(Event::End(e)) if e.local_name().as_ref() == b"sheetData" => {
                     self.in_sheet_data = false;
@@ -247,11 +282,27 @@ impl XlsxStreamReader {
                 _ => None,
             };
 
-            if let Some((pos, t_attr, is_empty)) = maybe_start {
+            if let Some((pos, t_attr, s_attr, is_empty)) = maybe_start {
                 let value = if is_empty {
                     Data::Empty
                 } else {
-                    self.read_cell_value(t_attr)?
+                    let s_attr_usize = s_attr;
+                    let col_idx = pos.1 as usize;
+                    if col_idx >= self.date_columns.len() {
+                        self.date_columns.resize(col_idx + 1, None);
+                    }
+                    let is_date = match self.date_columns[col_idx] {
+                        Some(cached) => cached,
+                        None => {
+                            let result = s_attr_usize
+                                .and_then(|idx| self.cell_xfs.get(idx))
+                                .map(|&id| self.is_date_numfmt(id))
+                                .unwrap_or(false);
+                            self.date_columns[col_idx] = Some(result);
+                            result
+                        }
+                    };
+                    self.read_cell_value(t_attr, is_date)?
                 };
                 return Ok(Some(Cell::new(pos, value)));
             }
@@ -262,7 +313,7 @@ impl XlsxStreamReader {
         path: &Path,
         sheet_name: Option<&str>,
         sheet_idx: Option<usize>,
-    ) -> Result<(Vec<String>, String)> {
+    ) -> Result<(Vec<String>, String, Vec<u32>, HashSet<u32>)> {
         let file = std::fs::File::open(path)?;
         let reader = BufReader::new(file);
         let mut archive = ZipArchive::new(reader)?;
@@ -284,8 +335,9 @@ impl XlsxStreamReader {
                 .clone(),
         };
         let strings = Self::read_shared_strings(&mut archive)?;
+        let (cell_xfs, custom_date_numfmts) = Self::read_styles(&mut archive)?;
 
-        Ok((strings, sheet_path))
+        Ok((strings, sheet_path, cell_xfs, custom_date_numfmts))
     }
 
     fn read_rels<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<HashMap<String, String>> {
@@ -437,6 +489,81 @@ impl XlsxStreamReader {
         Ok(strings)
     }
 
+    fn read_styles<R: Read + Seek>(
+        archive: &mut ZipArchive<R>,
+    ) -> Result<(Vec<u32>, HashSet<u32>)> {
+        let mut file = match archive.by_name("xl/styles.xml") {
+            Ok(f) => f,
+            Err(_) => return Ok((Vec::new(), HashSet::new())),
+        };
+        let mut data = Vec::new();
+        file.read_to_end(&mut data)?;
+        drop(file);
+
+        let mut reader = Reader::from_reader(Cursor::new(data));
+        let mut buf = Vec::new();
+        let mut cell_xfs: Vec<u32> = Vec::new();
+        let mut custom_date_numfmts: HashSet<u32> = HashSet::new();
+        let mut in_cell_xfs = false;
+        let mut in_num_fmts = false;
+
+        loop {
+            buf.clear();
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(e)) if e.local_name().as_ref() == b"numFmts" => {
+                    in_num_fmts = true;
+                }
+                Ok(Event::End(e)) if e.local_name().as_ref() == b"numFmts" => {
+                    in_num_fmts = false;
+                }
+                Ok(Event::Empty(e)) | Ok(Event::Start(e))
+                    if in_num_fmts && e.local_name().as_ref() == b"numFmt" =>
+                {
+                    if let Some(id_str) = Self::get_attribute(&e, b"numFmtId")? {
+                        if let Ok(id) = id_str.parse::<u32>() {
+                            if let Some(code) = Self::get_attribute(&e, b"formatCode")? {
+                                if Self::is_date_format_code(&code) {
+                                    custom_date_numfmts.insert(id);
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(Event::Start(e)) if e.local_name().as_ref() == b"cellXfs" => {
+                    in_cell_xfs = true;
+                }
+                Ok(Event::End(e)) if e.local_name().as_ref() == b"cellXfs" => {
+                    in_cell_xfs = false;
+                }
+                Ok(Event::Empty(e)) | Ok(Event::Start(e))
+                    if in_cell_xfs && e.local_name().as_ref() == b"xf" =>
+                {
+                    let num_fmt_id = Self::get_attribute(&e, b"numFmtId")?
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .unwrap_or(0);
+                    cell_xfs.push(num_fmt_id);
+                }
+                Ok(Event::End(e)) if e.local_name().as_ref() == b"styleSheet" => break,
+                Ok(Event::Eof) => break,
+                Err(e) => return Err(anyhow!("XML error in styles: {}", e)),
+                _ => {}
+            }
+        }
+        Ok((cell_xfs, custom_date_numfmts))
+    }
+
+    fn is_date_format_code(code: &str) -> bool {
+        let code_lower = code.to_lowercase();
+        let date_keywords = ['y', 'm', 'd', 'h', 's'];
+        date_keywords.iter().any(|&k| code_lower.contains(k))
+            && !code_lower.contains("0")
+            && !code_lower.contains("#")
+    }
+
+    fn is_date_numfmt(&self, num_fmt_id: u32) -> bool {
+        matches!(num_fmt_id, 14..=22 | 45..=47) || self.custom_date_numfmts.contains(&num_fmt_id)
+    }
+
     fn get_attribute(e: &BytesStart, key: &[u8]) -> Result<Option<String>> {
         for attr in e.attributes() {
             let attr = attr?;
@@ -487,7 +614,7 @@ impl XlsxStreamReader {
         }
     }
 
-    fn read_cell_value(&mut self, t_attr: Option<String>) -> Result<Data> {
+    fn read_cell_value(&mut self, t_attr: Option<&str>, is_date: bool) -> Result<Data> {
         let mut value = Data::Empty;
 
         loop {
@@ -495,7 +622,7 @@ impl XlsxStreamReader {
             match self.xml.read_event_into(&mut self.cell_buf) {
                 Ok(Event::Start(e)) if e.local_name().as_ref() == b"v" => {
                     let text = self.read_text_content(b"v")?;
-                    value = Self::parse_raw_value(&text, t_attr.as_deref())?;
+                    value = Self::parse_raw_value(&text, t_attr)?;
                 }
                 Ok(Event::Start(e)) if e.local_name().as_ref() == b"is" => {
                     let text = self.read_inline_str()?;
@@ -519,6 +646,17 @@ impl XlsxStreamReader {
                         .unwrap_or(Data::Empty);
                 }
             }
+        }
+
+        // 日期转换：已缓存为日期列的数字单元格直接转 DateTime
+        if is_date && (t_attr.is_none() || t_attr.as_deref() == Some("")) {
+            value = match value {
+                Data::Int(v) => {
+                    Data::DateTime(crate::excel_types::ExcelDateTime::new(v as f64, false))
+                }
+                Data::Float(v) => Data::DateTime(crate::excel_types::ExcelDateTime::new(v, false)),
+                other => other,
+            };
         }
 
         Ok(value)
@@ -604,7 +742,7 @@ mod tests {
         println!("shape: {:?}", reader.dimensions().end);
 
         while let Some(cell) = reader.next_cell()? {
-            if count < 5 {
+            if count < 14 {
                 println!("{:?}: {:?}", cell.get_position(), cell.get_value());
             }
             count += 1;

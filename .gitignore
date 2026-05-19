@@ -13,3 +13,5 @@ wheels/
 # Added by cargo
 
 /target
+zip/
+test_data.zip

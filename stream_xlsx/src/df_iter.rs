@@ -56,15 +56,7 @@ impl FromData for AnyValue<'static> {
             Data::Bool(v) => AnyValue::Boolean(v),
             Data::String(v) => AnyValue::StringOwned(PlSmallStr::from(v)),
             Data::DateTime(v) => {
-                let (y, m, d, h, min, s, ms) = v.to_ymd_hms_milli();
-                let naive = chrono::NaiveDate::from_ymd_opt(y as i32, m as u32, d as u32)
-                    .and_then(|d| d.and_hms_milli_opt(h as u32, min as u32, s as u32, ms as u32))
-                    .unwrap_or_default();
-                AnyValue::Datetime(
-                    naive.and_utc().timestamp_nanos_opt().unwrap_or(0),
-                    TimeUnit::Nanoseconds,
-                    None,
-                )
+                AnyValue::Datetime(v.to_timestamp_nanos(), TimeUnit::Nanoseconds, None)
             }
             Data::DateTimeIso(v) => AnyValue::StringOwned(PlSmallStr::from(v)),
             Data::DurationIso(v) => AnyValue::StringOwned(PlSmallStr::from(v)),

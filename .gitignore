@@ -16,3 +16,5 @@ wheels/
 zip/
 test_data.zip
 .DS_Store
+dhat-heap.json
+test_data.csv

@@ -158,7 +158,7 @@ impl XlsxStreamReader {
                     if e.local_name().as_ref() == b"dimension" =>
                 {
                     if let Some(ref_attr) = Self::get_attribute(&e, b"ref")? {
-                        dimensions = Self::parse_dimension(&ref_attr)?;
+                        dimensions = Self::parse_dimension(ref_attr.as_bytes())?;
                     }
                 }
                 Ok(Event::Start(e)) if e.local_name().as_ref() == b"sheetData" => {
@@ -240,9 +240,7 @@ impl XlsxStreamReader {
                         let attr = attr?;
                         match attr.key.as_ref() {
                             b"r" => {
-                                if let Ok(r_str) = std::str::from_utf8(&attr.value) {
-                                    pos = Some(Self::parse_a1(r_str)?);
-                                }
+                                pos = Some(Self::parse_a1(&attr.value)?);
                             }
                             b"t" => {
                                 t_attr = match attr.value.as_ref() {
@@ -574,20 +572,23 @@ impl XlsxStreamReader {
         Ok(None)
     }
 
-    fn parse_a1(s: &str) -> Result<(u32, u32)> {
-        let idx = s.find(|c: char| c.is_ascii_digit()).unwrap_or(s.len());
-        let col_str = &s[..idx];
-        let row_str = &s[idx..];
-        let row = row_str.parse::<u32>()?.saturating_sub(1);
+    fn parse_a1(s: &[u8]) -> Result<(u32, u32)> {
+        let mut i = 0;
         let mut col = 0u32;
-        for c in col_str.chars() {
-            col = col * 26 + (c.to_ascii_uppercase() as u32 - 'A' as u32 + 1);
+        while i < s.len() && s[i].is_ascii_alphabetic() {
+            col = col * 26 + ((s[i].to_ascii_uppercase() - b'A' + 1) as u32);
+            i += 1;
         }
-        Ok((row, col.saturating_sub(1)))
+        let mut row = 0u32;
+        while i < s.len() && s[i].is_ascii_digit() {
+            row = row * 10 + ((s[i] - b'0') as u32);
+            i += 1;
+        }
+        Ok((row.saturating_sub(1), col.saturating_sub(1)))
     }
 
-    fn parse_dimension(ref_attr: &str) -> Result<Dimensions> {
-        let parts: Vec<&str> = ref_attr.split(':').collect();
+    fn parse_dimension(ref_attr: &[u8]) -> Result<Dimensions> {
+        let parts: Vec<&[u8]> = ref_attr.split(|&b| b == b':').collect();
         if parts.len() == 1 {
             let (row, col) = Self::parse_a1(parts[0])?;
             Ok(Dimensions {
@@ -602,13 +603,16 @@ impl XlsxStreamReader {
                 end: (end_row, end_col),
             })
         } else {
-            Err(anyhow!("Invalid dimension: {}", ref_attr))
+            Err(anyhow!(
+                "Invalid dimension: {}",
+                String::from_utf8_lossy(ref_attr)
+            ))
         }
     }
 
     fn parse_cell_pos(e: &BytesStart, default_row: u32, default_col: u32) -> Result<(u32, u32)> {
         if let Some(r) = Self::get_attribute(e, b"r")? {
-            Self::parse_a1(&r)
+            Self::parse_a1(r.as_bytes())
         } else {
             Ok((default_row, default_col))
         }

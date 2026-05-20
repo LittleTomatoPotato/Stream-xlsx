@@ -187,7 +187,7 @@ pub struct DataFrameIter {
 
 impl DataFrameIter {
     pub fn new<P>(
-        batch_size: usize,
+        batch_size: Option<usize>,
         path: P,
         sheet_name: Option<&str>,
         sheet_idx: Option<usize>,
@@ -198,6 +198,10 @@ impl DataFrameIter {
     {
         let reader = XlsxStreamReader::new(path, sheet_name, sheet_idx)?;
         let dim = reader.dimensions();
+        let batch_size = match batch_size {
+            Some(s) => s,
+            None => dim.end.0 as usize + if has_header { 0 } else { 1 },
+        };
         let cols = Cols::new(&dim, batch_size);
         let mut iter = Self {
             reader,
@@ -370,7 +374,7 @@ impl ExactSizeIterator for DataFrameIter {}
 
 /// 便捷函数：直接返回一个 DataFrame 迭代器
 pub fn df_iter<P>(
-    batch_size: usize,
+    batch_size: Option<usize>,
     path: P,
     sheet_name: Option<&str>,
     sheet_idx: Option<usize>,
@@ -392,7 +396,7 @@ mod tests {
             .parent()
             .unwrap()
             .join("test_data.xlsx");
-        let iter = df_iter(10, &path, "Sheet1".into(), None, true)?;
+        let iter = df_iter(10.into(), &path, "Sheet1".into(), None, true)?;
         let mut total_rows = 0;
         for (i, batch) in iter.enumerate() {
             let df = batch?;

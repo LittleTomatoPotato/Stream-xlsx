@@ -16,7 +16,7 @@ pub struct Args {
         default_value = "10000",
         global = true
     )]
-    pub batch_size: usize,
+    pub batch_size: Option<usize>,
     #[arg(short = 'i', long, global = true)]
     pub ignore_case: bool,
     #[arg(short, long, global = true)]

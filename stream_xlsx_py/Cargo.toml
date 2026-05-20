@@ -13,4 +13,7 @@ pyo3 = { version = "0.27", features = ["extension-module"] }
 pyo3-polars = "0.26"
 
 [package.metadata.maturin]
-module-name = "stream_xlsx"
+module-name = "stream_xlsx_py"
+
+[tool.maturin]
+python-source = "python"

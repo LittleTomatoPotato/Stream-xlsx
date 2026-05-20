@@ -50,7 +50,7 @@ impl XlsxReader {
 #[pyo3(signature = (path, batch_size=10000, sheet_name=None, sheet_idx=None, has_header=true))]
 fn read_xlsx(
     path: &str,
-    batch_size: usize,
+    batch_size: Option<usize>,
     sheet_name: Option<String>,
     sheet_idx: Option<usize>,
     has_header: bool,

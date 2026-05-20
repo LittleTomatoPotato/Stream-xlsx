@@ -1,4 +1,4 @@
-/// 默认采用64KB作为内存切片的默认值, 后续可以考虑添加一个新的后台线程读取前N的块,记录最大值
+/// 默认采用256KB作为内存切片的默认值, 后续可以考虑添加一个新的后台线程读取前N的块,记录最大值 暂时不做过度优化自动处理切片大小节省内存
 use crate::excel_types::{Cell, CellErrorType, Data, Dimensions};
 use anyhow::{Context, Result, anyhow};
 use bytes::{Bytes, BytesMut};
@@ -38,9 +38,9 @@ impl OrderdSheets {
     fn get_by_idx(&self, idx: usize) -> Option<&String> {
         self.order.get(idx).map(|(_, path)| path)
     }
-    fn iter(&self) -> impl IntoIterator<Item = &(String, String)> {
-        self.order.iter()
-    }
+    // fn iter(&self) -> impl IntoIterator<Item = &(String, String)> {
+    //     self.order.iter()
+    // }
 }
 
 /// 通过 channel 把后台线程的解压数据流式喂给前端 Reader。

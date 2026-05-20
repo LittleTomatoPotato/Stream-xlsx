@@ -6,9 +6,7 @@ def main():
     start = time.time()
     # 用我们的 Rust 流式库读取
     print("=== stream_xlsx (惰性迭代器) ===")
-    reader = stream_xlsx_py.read_xlsx(
-        "target/release/test_data_1m.xslx", batch_size=1000000
-    )
+    reader = stream_xlsx_py.read_xlsx("target/release/test_data_1m.xslx")
     count = 0
     for df in reader:
         count += 1
@@ -22,7 +20,7 @@ def polars_read():
     import polars as pl
 
     start = time.time()
-    df = pl.read_excel("target/release/test_data_1m.xslx")
+    _df = pl.read_excel("target/release/test_data_1m.xslx")
     print(time.time() - start)
 
 

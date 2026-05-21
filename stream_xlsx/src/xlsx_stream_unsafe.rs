@@ -859,7 +859,7 @@ mod tests {
             Ok(sheets)
         }
 
-        let path = std::path::PathBuf::from("/Users/fc82/personal/project_x/test_data.xlsx");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../test_data.xlsx");
         println!("{:?}", path);
         let file = std::fs::File::open(path)?;
         let reader = BufReader::new(file);

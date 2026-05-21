@@ -71,17 +71,38 @@ for df in reader:
 
 ## 性能对比
 
-测试文件：**100 万行 × 60 列**（`project_x test test-file` 生成，约 659 MB）
+测试文件：**100 万行 × 60 列**（`project_x test test-file --rows 1000000 --col 60` 生成，约 659 MB）
+
+### 1. 全量加载对比
+
+将整张表一次性读入单个 DataFrame：
 
 | 方案 | 耗时 | 说明 |
 |------|------|------|
-| **stream_xlsx (CLI)** | **~18.4 s** | batch_size=10k，流式 count |
-| **stream_xlsx_py** | **~18.3 s** | Python 绑定，同 batch_size |
-| polars + calamine | ~23.6 s | `pl.read_excel(engine="calamine")` |
-| polars + xlsx2csv | ~96.0 s | `pl.read_excel(engine="xlsx2csv")` |
+| **stream_xlsx_py (bs=1M)** | **20.71 s** | 单 batch，等效全量 |
+| polars + calamine | 25.72 s | `pl.read_excel(engine="calamine")` |
+| polars + xlsx2csv | 96.89 s | `pl.read_excel(engine="xlsx2csv")` |
 | polars + openpyxl | >60 s | 超时未完成 |
 
-> 测试环境：macOS, Apple Silicon, release 构建。stream_xlsx 比 polars+calamine 快约 **22%**。
+> 测试环境：macOS, Apple Silicon, release 构建。stream_xlsx 比 polars+calamine 快约 **19%**。
+
+### 2. 流式读取对比（stream_xlsx 不同 batch_size）
+
+逐 batch 遍历，不保留中间结果（`for df in reader: pass`）：
+
+| batch_size | Python 绑定 | CLI count |
+|-----------|-------------|-----------|
+| 1,000 | 19.02 s | 18.25 s |
+| 5,000 | 18.33 s | 18.42 s |
+| **10,000** | **18.14 s** | **18.50 s** |
+| 50,000 | 18.32 s | 18.46 s |
+| 100,000 | 18.64 s | 18.43 s |
+| 1,000,000 | 20.71 s | — |
+
+**观察**：
+- 流式遍历比全量加载更快（18 s vs 20 s），因为无需在内存中维持超大 DataFrame
+- **batch_size=10,000 是甜点**，过小（1k）会增加 Python 迭代开销，过大（100k）使每批 Polars 构建成本上升
+- 10k 行/批在速度和内存之间取得了最佳平衡
 
 小文件（10 万行 × 7 列）同样流畅：
 

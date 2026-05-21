@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "stream_xlsx", "stream_xlsx_py"]
+members = [".", "stream_xlsx"]
 default-members = [".", "stream_xlsx"]
 resolver = "2"
 

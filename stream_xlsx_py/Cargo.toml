@@ -17,3 +17,6 @@ module-name = "stream_xlsx_py"
 
 [tool.maturin]
 python-source = "python"
+
+# 声明为独立 workspace，避免被上级 workspace 包含，同时不影响 maturin build
+[workspace]

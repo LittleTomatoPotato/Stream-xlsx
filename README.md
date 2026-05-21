@@ -12,8 +12,9 @@ stream_xlsx_py/     # pyo3 Python 绑定（maturin build）
 
 ## 特点
 
-- **流式读取**：逐 batch 产出 Polars DataFrame，100 万行 × 60 列（659 MB）也只需 ~18 秒
-- **低内存**：峰值内存与文件大小解耦，batch_size 可控
+- **流式读取**：逐 batch 产出 Polars DataFrame，100 万行 × 60 列（659 MB）只需 ~18–21 秒
+- **双模式 Reader**：`default`（原始实现）与 `lm`（低内存优化），CLI 通过 `--reader` 切换，Python 通过 `reader=` 参数切换
+- **低内存**：`lm` 模式峰值内存比 `default` 降低 **~35–50%**，比 polars+calamine 降低 **~70%**
 - **类型推断**：边读边推断列类型（Int → Float → String），空值不参与推断
 - **日期支持**：读取 `xl/styles.xml` 的 `cellXfs` + 自定义 `numFmt`，自动识别日期列
 - **Shell 补全**：内置 zsh / bash 自动补全生成
@@ -32,7 +33,7 @@ cargo build --release
 ```bash
 cd stream_xlsx_py
 maturin build --release
-pip install ../target/wheels/stream_xlsx_py-*.whl
+pip install target/wheels/stream_xlsx_py-*.whl
 ```
 
 ## 使用
@@ -50,6 +51,9 @@ project_x csv data.xlsx --sheet-idx 0
 # 统计行数（性能基准）
 project_x test count data.xlsx
 
+# 使用低内存模式（推荐大文件）
+project_x --reader lm test count data.xlsx
+
 # 生成测试文件：100 万行 × 60 列
 project_x test test-file big.xlsx --rows 1000000 --col 60
 
@@ -60,117 +64,92 @@ project_x completion zsh > ~/.zsh_completions/_project_x
 ### Python
 
 ```python
-import stream_xlsx_py as stream_xlsx
+import stream_xlsx_py as sx
 
-# 惰性迭代，每批 10,000 行
-reader = stream_xlsx.read_xlsx("data.xlsx", batch_size=10000)
-for df in reader:
-    print(df.shape)   # (10000, 60)
-    # df 是 polars.DataFrame，直接处理
+# 默认 reader
+for df in sx.read_xlsx("data.xlsx", batch_size=10000):
+    print(df.shape)
+
+# 低内存模式（推荐大文件）
+for df in sx.read_xlsx("data.xlsx", batch_size=10000, reader="lm"):
+    print(df.shape)
 ```
 
-## 性能对比
+## Benchmark
 
-测试文件：**100 万行 × 60 列**（`project_x test test-file --rows 1000000 --col 60` 生成，约 659 MB）
+测试文件：`test_100w_60c.xlsx`（100 万行 × 60 列，`project_x test test-file --rows 1000000 --col 60` 生成，约 659 MB）
 
-### 1. 全量加载对比
+测试环境：macOS, Apple Silicon, release 构建。内存采样间隔 50 ms。
 
-将整张表一次性读入单个 DataFrame：
+### Python 环境对比
 
-| 方案 | 耗时 | 说明 |
-|------|------|------|
-| **stream_xlsx_py (bs=1M)** | **19.37 s** | 单 batch，等效全量 |
-| polars + calamine | 24.30 s | `pl.read_excel(engine="calamine")` |
-| polars + xlsx2csv | 93.80 s | `pl.read_excel(engine="xlsx2csv")` |
-| polars + openpyxl | >60 s | 超时未完成 |
+在 Python 进程中对比 `stream_xlsx_py` 流式遍历与 `polars.read_excel` 全量加载：
 
-> 测试环境：macOS, Apple Silicon, release 构建。stream_xlsx 比 polars+calamine 快约 **20%**。
+| 方案 | 时间 | 峰值内存 | 说明 |
+|------|------|---------|------|
+| **stream_xlsx_py (lm, bs=10k)** | **19.87 s** | **2,619 MB** | 流式遍历，低内存模式 |
+| stream_xlsx_py (default, bs=10k) | 19.55 s | 4,960 MB | 流式遍历，默认模式 |
+| stream_xlsx_py (lm, bs=1M) | 20.24 s | 6,120 MB | 全量加载（单 batch） |
+| stream_xlsx_py (default, bs=1M) | 19.37 s | 6,530 MB | 全量加载（单 batch） |
+| polars + calamine | 25.05 s | 8,858 MB | `pl.read_excel(engine="calamine")` |
+| polars + xlsx2csv | 95.16 s | 8,526 MB | `pl.read_excel(engine="xlsx2csv")` |
 
-### 2. 流式读取对比（stream_xlsx 不同 batch_size）
+**结论**：
+- `stream_xlsx_py` 比 polars+calamine **快 21%**，内存 **低 70%**
+- `lm` 模式比 `default` 内存再降 **47%**，时间持平
+- 全量加载（bs=1M）时 stream_xlsx_py 与 polars 内存接近，但仍快 **23%**
 
-逐 batch 遍历，不保留中间结果（`for df in reader: pass`）：
+![Python 环境内存曲线](docs/benchmark/python_memory_comparison.png)
 
-| batch_size | Python 绑定 | CLI count |
-|-----------|-------------|-----------|
-| 1,000 | 18.96 s | 18.29 s |
-| 5,000 | 18.76 s | 18.27 s |
-| **10,000** | **18.57 s** | **18.47 s** |
-| 50,000 | 18.70 s | 18.41 s |
-| 100,000 | 18.77 s | 18.46 s |
-| 1,000,000 | 19.37 s | 18.61  |
+上图可见 polars calamine 在 ~25 s 达到 ~8.9 GB 峰值，而 stream_xlsx_py 全程稳定在 2.6–6.5 GB；`lm` 模式上升最平缓，峰值最低。
 
-**观察**：
-- 流式遍历比全量加载更快（18 s vs 19 s），因为无需在内存中维持超大 DataFrame
-- 当前问价大小下**batch_size=10,000 是甜点**，过小（1k）会增加 Python 迭代开销，过大（100k）使每批 Polars 构建成本上升
-- 10k 行/批在速度和内存之间取得了最佳平衡
+### CLI 环境对比（default vs lm）
 
-小文件（10 万行 × 7 列）同样流畅：
+逐 batch 遍历不保留中间结果（`project_x test count`）：
+
+| batch_size | default 时间 | lm 时间 | default 峰值 | lm 峰值 | 降幅 |
+|-----------|-------------|---------|-------------|---------|------|
+| 1,000 | 18.87 s | **18.03 s** | 4,949 MB | **2,512 MB** | **–49%** |
+| 5,000 | 18.65 s | **18.00 s** | 4,943 MB | **2,525 MB** | **–49%** |
+| **10,000** | 18.62 s | **18.11 s** | 4,941 MB | **2,546 MB** | **–48%** |
+| 50,000 | 19.89 s | **18.04 s** | 4,948 MB | **2,750 MB** | **–44%** |
+| 100,000 | 18.97 s | **18.04 s** | 4,955 MB | **3,183 MB** | **–36%** |
+| 1,000,000 | 18.68 s | **18.42 s** | 6,429 MB | **6,074 MB** | **–6%** |
+
+**结论**：
+- `lm` 比 `default` **快 3–5%**，内存降低 **36–49%**（流式场景）
+- batch_size 对时间影响极小，瓶颈在 XML 解析和 ZIP 解压
+- **全量加载（bs=1M）**：lm 优势收窄（–6%），因为最终需要容纳 100 万行 × 60 列的 DataFrame，此时内存主要由 Polars 决定
+
+![CLI 全条件内存网格](docs/benchmark/cli_memory_all_grid.png)
+
+上图展示了 12 个测试条件的内存曲线网格（2 readers × 6 batch sizes）。default（上行）在 ~7 s 出现明显峰值后骤降，lm（下行）曲线更平滑，全程线性上升后直接进入平稳期。全量加载（bs=1M，最右列）两者内存趋于一致，因为最终都需要容纳完整的 DataFrame。
+
+![CLI batch=10000 对比](docs/benchmark/cli_memory_batch_10000.png)
+
+batch=10000 时对比最清晰：default 在 7 s 达到 ~5 GB 峰值后骤降，lm 线性上升至 ~2.5 GB 后平稳，无 spikes。
+
+### 为什么 lm 内存更低？
+
+default 的 `prepare()` 阶段使用 `read_to_end` 一次性读取 `sharedStrings.xml`（约 2 GB），ZIP 解压缓冲 + XML 解析器缓冲共同推高内存到 ~5 GB；解析完成后缓冲释放，造成 50 ms 内骤降 ~2 GB。
+
+lm 的 `prepare()` 改为 `BufReader` 直接流式解析，无中间 `Vec<u8>` 缓冲；`sharedStrings` 边读边解析到 `Vec<Box<str>>`，每元素比 `Vec<String>` 省 24 bytes 容量开销。内存曲线呈线性增长后直接进入平稳期。
+
+### 推荐配置
+
+| 场景 | 推荐参数 |
+|------|---------|
+| 超大文件（>100 MB）| `--reader lm --batchsize 10000` |
+| 中等文件（10–100 MB）| `--reader lm --batchsize 10000` |
+| 小文件（<10 MB）| `--batchsize 10000`（default 即可） |
+| 全量加载到单个 DataFrame | `--batchsize 1000000`（bs=1M 等效全量） |
+
+小文件示例：
 
 ```bash
 $ project_x --batchsize 10000 test count test_data.xlsx
 11 145ms
 ```
-
-## 内存使用情况
-
-测试文件：`test_100w_60c.xlsx`（100 万行 × 60 列，约 659 MB）
-
-文件内部结构：
-- `xl/sharedStrings.xml`：约 **2.0 GB**（几乎未压缩）
-- `xl/worksheets/sheet1.xml`：约 **2.3 GB**（几乎未压缩）
-
-### 内存时间线（batch_size=10,000）
-
-实时采样（50 ms 间隔）观察到非常明显的**两阶段内存模式**：
-
-| 时间 | 内存 | 阶段 |
-|------|------|------|
-| 0.00 s | 0.5 MB | 进程启动 |
-| 1.0 s | ~1.2 GB | 开始解压/解析 `sharedStrings.xml` |
-| 6.0 s | ~4.4 GB | sharedStrings 持续膨胀 |
-| **7.02 s** | **4,954.6 MB** | **峰值** |
-| **7.07 s** | **2,918.3 MB** | **骤降 ~2,036 MB** |
-| 8.5 s ~ 18.5 s | ~2,956 MB | **流式读取阶段，内存几乎持平** |
-
-```
-内存 (GB)
-   5.0 ┤        ╭─╮
-   4.5 ┤      ╭─╯ │     prepare()：解析 sharedStrings.xml
-   4.0 ┤    ╭─╯   │     （ZIP 解压缓冲 + XML 解析器缓冲持续累积）
-   3.5 ┤  ╭─╯     │
-   3.0 ┤─╯        ╰──────────── 流式读取：sheet1.xml
-   2.5 ┤                         （内存稳定，batch 间几乎无累积）
-       └────┬────┬────┬────┬────┬────
-            0    2    4    6    8   10  时间 (s)
-```
-
-**骤降原因**：`prepare()` 阶段一次性读取 `sharedStrings.xml`（约 2 GB）时，ZIP 解压缓冲和 XML 解析器缓冲共同推高了内存；一旦 sharedStrings 解析完成并转为 `Vec<String>` 常驻，解压缓冲立即释放，导致内存**在 50 ms 内骤降约 2 GB**。
-
-### 不同 batch_size 的峰值内存
-
-| batch_size | 峰值内存 | 说明 |
-|-----------|---------|------|
-| 1,000 | **5.20 GB** | 同上，prepare 阶段峰值 |
-| 10,000 | **5.47 GB** | Polars 构建 DataFrame 时临时分配略高 |
-| 100,000 | **5.20 GB** | 与 1k 持平 |
-| 1,000,000 | **6.80 GB** | 单 batch 容纳 100 万行 DataFrame，额外 **+1.6 GB** |
-
-### 分析
-
-- **基线 ~5.2 GB** 主要由三部分构成：
-  1. `sharedStrings.xml` 解析后的 `Vec<String>` 常驻内存（约 2 GB）
-  2. ZIP 解压缓冲 + quick-xml 解析器缓冲（约 2 GB+）
-  3. 每批 Polars DataFrame 的临时分配（几百 MB）
-
-- **batch_size 对内存影响有限**：1k 与 100k 的峰值内存几乎相同，因为瓶颈不在 DataFrame 本身，而在 sharedStrings 解析阶段的缓冲。
-
-- **流式读取阶段内存几乎持平**：一旦进入 sheet 数据读取，每批 DataFrame 在迭代后被 drop，内存曲线呈水平线，**无累积增长**。
-
-- **全量加载（bs=1M）内存显著上升**：从 5.2 GB 增至 6.8 GB，增量约 1.6 GB，即 100 万行 × 60 列 DataFrame 的内存 footprint。
-
-> 结论：对于超大 xlsx，流式读取的核心价值有两层：
-> 1. **避免 prepare 阶段以外的内存 spikes**（sheet 数据读取时内存稳定）
-> 2. **避免一次性构建超大 DataFrame**（bs=1M 比 bs=10k 多占 1.6 GB）
 
 ## 构建
 

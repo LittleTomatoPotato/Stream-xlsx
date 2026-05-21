@@ -1,224 +1,222 @@
 #!/usr/bin/env python3
-"""
-性能基准测试脚本 —— 复现 README 中的性能对比数据
+"""Benchmark both readers across batch sizes, measuring time-series RSS."""
 
-依赖:
-    pip install polars stream_xlsx_py xlsx2csv
-
-用法:
-    python benchmark.py [xlsx文件路径]
-
-默认测试文件:
-    test_100w_60c.xlsx (100万行×60列, 约659MB)
-    若不存在，可先用 CLI 生成:
-        ./target/release/project_x test test-file test_100w_60c.xlsx --rows 1000000 --col 60
-"""
-
-import os
+import csv
+import json
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# 配置
-# ---------------------------------------------------------------------------
-DEFAULT_BIG_FILE = "test_100w_60c.xlsx"
-DEFAULT_SMALL_FILE = "test_data.xlsx"
-CLI_BIN = "./target/release/project_x"
-BATCH_SIZES = [1_000, 5_000, 10_000, 50_000, 100_000, 1_000_000]
+import matplotlib
+import matplotlib.pyplot as plt
+import psutil
+
+matplotlib.use("Agg")
 
 
-# ---------------------------------------------------------------------------
-# 工具函数
-# ---------------------------------------------------------------------------
-def find_test_file(argv):
-    if len(argv) > 1:
-        p = Path(argv[1])
-        if p.exists():
-            return str(p)
-        print(f"[错误] 指定文件不存在: {p}")
+def run_benchmark(reader: str, batch_size: int, file: Path) -> dict:
+    cmd = [
+        "./target/release/project_x",
+        "-B",
+        str(batch_size),
+        "-R",
+        reader,
+        "test",
+        "count",
+        str(file),
+    ]
+    print(f"  → {' '.join(cmd)}")
+
+    start = time.perf_counter()
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    p = psutil.Process(proc.pid)
+
+    timestamps = []
+    rss_series = []
+    peak_rss_mb = 0.0
+
+    try:
+        while proc.poll() is None:
+            try:
+                mem = p.memory_info().rss
+                peak_rss_mb = max(peak_rss_mb, mem / 1024 / 1024)
+                timestamps.append(time.perf_counter() - start)
+                rss_series.append(mem / 1024 / 1024)
+            except psutil.NoSuchProcess:
+                break
+            time.sleep(0.05)
+    finally:
+        proc.wait()
+
+    elapsed = time.perf_counter() - start
+    stdout = (
+        proc.stdout.read().decode("utf-8", errors="replace").strip()
+        if proc.stdout
+        else ""
+    )
+    stderr = (
+        proc.stderr.read().decode("utf-8", errors="replace").strip()
+        if proc.stderr
+        else ""
+    )
+
+    return {
+        "reader": reader,
+        "batch_size": batch_size,
+        "elapsed_sec": round(elapsed, 2),
+        "peak_rss_mb": round(peak_rss_mb, 1),
+        "timestamps": [round(t, 2) for t in timestamps],
+        "rss_series": [round(r, 1) for r in rss_series],
+        "stdout": stdout,
+        "stderr": stderr,
+        "returncode": proc.returncode,
+    }
+
+
+def plot_all(results: list, out_dir: Path):
+    out_dir.mkdir(exist_ok=True)
+    readers = ["default", "lm"]
+    colors = plt.cm.tab10
+
+    # 1. Per-reader combined figure (all batch sizes on one plot)
+    for r_idx, reader in enumerate(readers):
+        fig, ax = plt.subplots(figsize=(10, 5))
+        reader_results = [res for res in results if res["reader"] == reader]
+        for i, res in enumerate(reader_results):
+            ax.plot(
+                res["timestamps"],
+                res["rss_series"],
+                label=f"batch={res['batch_size']}",
+                color=colors(i),
+                linewidth=1.2,
+            )
+        ax.set_title(f"Memory Usage Over Time — Reader: {reader}")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("RSS (MB)")
+        ax.legend(loc="upper right")
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(out_dir / f"memory_{reader}.png", dpi=150)
+        plt.close(fig)
+
+    # 2. Per-batch-size comparison figure (default vs lm)
+    batch_sizes = sorted({res["batch_size"] for res in results})
+    for bs in batch_sizes:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        for r_idx, reader in enumerate(readers):
+            res = next(
+                (r for r in results if r["reader"] == reader and r["batch_size"] == bs),
+                None,
+            )
+            if res:
+                ax.plot(
+                    res["timestamps"],
+                    res["rss_series"],
+                    label=f"{reader}",
+                    color=colors(r_idx),
+                    linewidth=1.5,
+                )
+        ax.set_title(f"Memory Usage Over Time — Batch Size: {bs}")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("RSS (MB)")
+        ax.legend(loc="upper right")
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(out_dir / f"memory_batch_{bs}.png", dpi=150)
+        plt.close(fig)
+
+    # 3. 2x6 grid: every condition gets its own mini-plot
+    fig, axes = plt.subplots(2, 6, figsize=(24, 8), sharey=True)
+    for r_idx, reader in enumerate(readers):
+        for b_idx, bs in enumerate(batch_sizes):
+            ax = axes[r_idx][b_idx]
+            res = next(
+                (r for r in results if r["reader"] == reader and r["batch_size"] == bs),
+                None,
+            )
+            if res:
+                ax.plot(
+                    res["timestamps"],
+                    res["rss_series"],
+                    color=colors(r_idx),
+                    linewidth=1,
+                )
+                ax.set_title(f"{reader}\nbatch={bs}", fontsize=10)
+                ax.set_xlabel("Time (s)", fontsize=8)
+                if b_idx == 0:
+                    ax.set_ylabel("RSS (MB)", fontsize=8)
+                ax.grid(True, alpha=0.3)
+    fig.suptitle("Memory Usage Over Time — All Conditions", fontsize=14)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(out_dir / "memory_all_grid.png", dpi=150)
+    plt.close(fig)
+
+
+def main():
+    file = Path("test_100w_60c.xlsx")
+    if not file.exists():
+        print(f"File not found: {file}")
         sys.exit(1)
 
-    for candidate in (DEFAULT_BIG_FILE, DEFAULT_SMALL_FILE):
-        if Path(candidate).exists():
-            return candidate
-
-    print(f"[错误] 未找到默认测试文件 ({DEFAULT_BIG_FILE} 或 {DEFAULT_SMALL_FILE})")
-    print(f"       请先用 CLI 生成大文件:")
-    print(f"       {CLI_BIN} test test-file {DEFAULT_BIG_FILE} --rows 1000000 --col 60")
-    sys.exit(1)
-
-
-def fmt_sec(t: float) -> str:
-    if t < 1.0:
-        return f"{t * 1000:.2f} ms"
-    return f"{t:.2f} s"
-
-
-def timeit(name: str, fn, *args, **kwargs) -> float:
-    print(f"  → 运行 {name} ...", end=" ", flush=True)
-    t0 = time.perf_counter()
-    try:
-        fn(*args, **kwargs)
-    except Exception as e:
-        print(f"失败 ({e})")
-        return float("nan")
-    elapsed = time.perf_counter() - t0
-    print(f"{fmt_sec(elapsed)}")
-    return elapsed
-
-
-# ---------------------------------------------------------------------------
-# 测试项
-# ---------------------------------------------------------------------------
-def bench_stream_py_stream(path: str, batch_size: int):
-    """stream_xlsx_py 流式遍历 (for df in reader: pass)"""
-    import stream_xlsx_py as stream_xlsx
-
-    reader = stream_xlsx.read_xlsx(path, batch_size=batch_size)
-    for _ in reader:
-        pass
-
-
-def bench_stream_py_full(path: str):
-    """stream_xlsx_py 全量加载 (batch_size=1M)"""
-    bench_stream_py_stream(path, 1_000_000)
-
-
-def bench_polars_calamine(path: str):
-    """polars + calamine 全量加载"""
-    import polars as pl
-
-    pl.read_excel(path, engine="calamine")
-
-
-def bench_polars_xlsx2csv(path: str):
-    """polars + xlsx2csv 全量加载"""
-    import polars as pl
-
-    pl.read_excel(path, engine="xlsx2csv")
-
-
-def parse_rust_duration(s: str) -> float:
-    """解析 Rust std::time::Duration 的 Debug 输出，如 151.017792ms / 1s 23ms / 12.345s"""
-    total = 0.0
-    for m in __import__("re").finditer(r"(\d+(?:\.\d+)?)(ns|µs|ms|s)", s):
-        val = float(m.group(1))
-        unit = m.group(2)
-        if unit == "ns":
-            total += val * 1e-9
-        elif unit == "µs":
-            total += val * 1e-6
-        elif unit == "ms":
-            total += val * 1e-3
-        elif unit == "s":
-            total += val
-    return total
-
-
-def bench_cli_count(path: str, batch_size: int) -> float:
-    """CLI `project_x test count` —— 解析 CLI 内部计时，避免子进程创建开销"""
-    cmd = [CLI_BIN, "test", "count", path, "--batchsize", str(batch_size)]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip())
-    # 输出格式: "<count> <duration>"
-    parts = result.stdout.strip().split()
-    if len(parts) >= 2:
-        return parse_rust_duration(parts[-1])
-    raise RuntimeError(f"无法解析 CLI 输出: {result.stdout.strip()}")
-
-
-# ---------------------------------------------------------------------------
-# 主流程
-# ---------------------------------------------------------------------------
-def main():
-    path = find_test_file(sys.argv)
-    size_mb = Path(path).stat().st_size / (1024 * 1024)
-    print(f"测试文件: {path} ({size_mb:.1f} MB)\n")
-
+    readers = ["default", "lm"]
+    batch_sizes = [1_000, 5_000, 10_000, 50_000, 100_000, 1_000_000]
     results = []
 
-    # --- 1. 全量加载对比 ---
-    print("=" * 60)
-    print("1. 全量加载对比 (一次性读入单个 DataFrame)")
-    print("=" * 60)
+    for reader in readers:
+        print(f"\n{'=' * 60}")
+        print(f"Reader: {reader}")
+        print(f"{'=' * 60}")
+        for bs in batch_sizes:
+            result = run_benchmark(reader, bs, file)
+            results.append(result)
+            status = "✅" if result["returncode"] == 0 else "❌"
+            print(
+                f"    {status} batch={bs:>7}  time={result['elapsed_sec']:>6.2f}s  "
+                f"peak_mem={result['peak_rss_mb']:>8.1f}MB  rows={result['stdout']}"
+            )
+            if result["stderr"]:
+                print(f"       stderr: {result['stderr']}")
 
-    try:
-        t = timeit("stream_xlsx_py (bs=1M)", bench_stream_py_full, path)
-        results.append(("stream_xlsx_py (bs=1M)", t))
-    except ImportError:
-        print("  → 跳过 stream_xlsx_py (未安装)")
+    # Save raw time-series data
+    ts_path = Path("benchmark_timeseries.json")
+    with ts_path.open("w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\nTime-series data saved to {ts_path}")
 
-    try:
-        t = timeit("polars + calamine", bench_polars_calamine, path)
-        results.append(("polars + calamine", t))
-    except ImportError:
-        print("  → 跳过 polars + calamine (未安装)")
+    # Save summary CSV
+    csv_path = Path("benchmark_results.csv")
+    with csv_path.open("w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "reader",
+                "batch_size",
+                "elapsed_sec",
+                "peak_rss_mb",
+                "returncode",
+                "stdout",
+            ],
+        )
+        writer.writeheader()
+        for r in results:
+            writer.writerow({k: r[k] for k in writer.fieldnames})
+    print(f"Summary CSV saved to {csv_path}")
 
-    try:
-        t = timeit("polars + xlsx2csv", bench_polars_xlsx2csv, path)
-        results.append(("polars + xlsx2csv", t))
-    except ImportError:
-        print("  → 跳过 polars + xlsx2csv (未安装)")
+    # Generate plots
+    out_dir = Path("benchmark_plots")
+    plot_all(results, out_dir)
+    print(f"Plots saved to {out_dir}/")
 
-    print()
-    print("-" * 40)
-    print(f"{'方案':<28} {'耗时':>10}")
-    print("-" * 40)
-    for name, t in results:
-        print(f"{name:<28} {fmt_sec(t):>10}")
-    print("-" * 40)
-
-    # --- 2. 流式读取对比 ---
-    print()
-    print("=" * 60)
-    print("2. 流式读取对比 (逐 batch 遍历，不保留中间结果)")
-    print("=" * 60)
-
-    stream_results = []
-    cli_results = []
-
-    for bs in BATCH_SIZES:
-        if bs == 1_000_000:
-            # 1M 已经在全量加载测过，这里跳过或复用结果
-            continue
-
-        label = f"{bs:,}"
-        try:
-            t = timeit(f"stream_xlsx_py bs={label}", bench_stream_py_stream, path, bs)
-            stream_results.append((label, t))
-        except ImportError:
-            stream_results.append((label, float("nan")))
-
-        try:
-            print(f"  → 运行 CLI count bs={label} ...", end=" ", flush=True)
-            t = bench_cli_count(path, bs)
-            print(f"{fmt_sec(t)}")
-            cli_results.append((label, t))
-        except Exception as e:
-            print(f"失败 ({e})")
-            cli_results.append((label, float("nan")))
-
-    # 把 bs=1M 的流式结果也加进来（和全量是同一回事）
-    if results:
-        # 找到 stream_xlsx_py (bs=1M) 的结果
-        for name, t in results:
-            if "bs=1M" in name:
-                stream_results.append(("1,000,000", t))
-                break
-
-    print()
-    print("-" * 50)
-    print(f"{'batch_size':<12} {'Python 绑定':>18} {'CLI count':>18}")
-    print("-" * 50)
-    for (bs1, t1), (bs2, t2) in zip(stream_results, cli_results):
-        assert bs1 == bs2, "batch_size 对齐错误"
-        s1 = fmt_sec(t1) if not (t1 != t1) else "N/A"  # nan check
-        s2 = fmt_sec(t2) if not (t2 != t2) else "N/A"
-        print(f"{bs1:<12} {s1:>18} {s2:>18}")
-    print("-" * 50)
+    # Print summary table
+    print("\n" + "=" * 70)
+    print(f"{'Reader':<10} {'Batch':>8} {'Time(s)':>10} {'Peak(MB)':>12}")
+    print("-" * 70)
+    for r in results:
+        print(
+            f"{r['reader']:<10} {r['batch_size']:>8} {r['elapsed_sec']:>10.2f} {r['peak_rss_mb']:>12.1f}"
+        )
+    print("=" * 70)
 
 
 if __name__ == "__main__":

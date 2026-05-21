@@ -6,7 +6,7 @@ use bytes::{Bytes, BytesMut};
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use std::collections::{HashMap, HashSet};
-use std::io::{BufReader, Cursor, Read, Seek};
+use std::io::{BufRead, BufReader, Read, Seek};
 use std::path::Path;
 use zip::ZipArchive;
 
@@ -14,32 +14,56 @@ const CHUNK_SIZE: usize = 256 * 1024; // 256K
 const CHANNEL_CAPACITY: usize = 4;
 
 /// 通过 channel 把后台线程的解压数据流式喂给前端 Reader。
+/// 直接实现 BufRead，省去外层的 BufReader 包裹。
 struct ChannelReader {
     rx: std::sync::mpsc::Receiver<Bytes>,
-    current: Option<std::io::Cursor<Bytes>>,
+    current: Bytes,
+    pos: usize,
 }
 
 impl ChannelReader {
     fn new(rx: std::sync::mpsc::Receiver<Bytes>) -> Self {
-        Self { rx, current: None }
+        Self {
+            rx,
+            current: Bytes::new(),
+            pos: 0,
+        }
     }
 }
 
 impl Read for ChannelReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        loop {
-            if let Some(ref mut cur) = self.current {
-                let n = cur.read(buf)?;
-                if n > 0 {
-                    return Ok(n);
-                }
-                self.current = None;
+        let mut nread = 0;
+        while nread < buf.len() {
+            let slice = self.fill_buf()?;
+            if slice.is_empty() {
+                break;
             }
+            let n = slice.len().min(buf.len() - nread);
+            buf[nread..nread + n].copy_from_slice(&slice[..n]);
+            nread += n;
+            self.consume(n);
+        }
+        Ok(nread)
+    }
+}
+
+impl BufRead for ChannelReader {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        while self.pos >= self.current.len() {
             match self.rx.recv() {
-                Ok(data) => self.current = Some(std::io::Cursor::new(data)),
-                Err(_) => return Ok(0),
+                Ok(data) => {
+                    self.current = data;
+                    self.pos = 0;
+                }
+                Err(_) => return Ok(&[]),
             }
         }
+        Ok(&self.current[self.pos..])
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.pos = (self.pos + amt).min(self.current.len());
     }
 }
 
@@ -51,8 +75,8 @@ impl Read for ChannelReader {
 ///    通过有限容量 channel 发送给主线程。
 /// 3. 主线程用 quick-xml 从 channel 上逐事件解析 `<row>` / `<c>`。
 pub struct XlsxStreamReader {
-    xml: Reader<BufReader<ChannelReader>>,
-    strings: Vec<String>,
+    xml: Reader<ChannelReader>,
+    strings: Vec<Box<str>>,
     cell_xfs: Vec<u32>,
     custom_date_numfmts: HashSet<u32>,
     date_columns: Vec<Option<bool>>,
@@ -82,24 +106,34 @@ impl XlsxStreamReader {
                 let reader = BufReader::new(file);
                 let mut archive = ZipArchive::new(reader)?;
                 let mut zip_file = archive.by_name(&sheet_path)?;
-                let mut buf = BytesMut::with_capacity(CHUNK_SIZE);
-                // let mut sizes: Vec<usize> = Vec::new();
+                let mut accumulate = BytesMut::with_capacity(CHUNK_SIZE * 2);
+                let mut temp = BytesMut::with_capacity(CHUNK_SIZE);
                 loop {
-                    buf.reserve(CHUNK_SIZE);
-                    let spare = buf.spare_capacity_mut();
+                    temp.reserve(CHUNK_SIZE);
+                    let spare = temp.spare_capacity_mut();
                     let dst = unsafe {
                         std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len())
                     };
                     match zip_file.read(dst) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            // sizes.push(n);
-                            unsafe {
-                                buf.set_len(buf.len() + n);
+                        Ok(0) => {
+                            if !accumulate.is_empty() {
+                                if tx.send(accumulate.split().freeze()).is_err() {
+                                    break;
+                                }
                             }
-                            let chunk = buf.split_to(n).freeze();
-                            if tx.send(chunk).is_err() {
-                                break;
+                            break;
+                        }
+                        Ok(n) => {
+                            unsafe {
+                                temp.set_len(temp.len() + n);
+                            }
+                            accumulate.extend_from_slice(&temp[..n]);
+                            temp.clear();
+                            if accumulate.len() >= CHUNK_SIZE {
+                                let chunk = accumulate.split_to(CHUNK_SIZE).freeze();
+                                if tx.send(chunk).is_err() {
+                                    break;
+                                }
                             }
                         }
                         Err(e) => {
@@ -115,7 +149,7 @@ impl XlsxStreamReader {
         });
 
         let channel_reader = ChannelReader::new(rx);
-        let mut xml = Reader::from_reader(BufReader::new(channel_reader));
+        let mut xml = Reader::from_reader(channel_reader);
         let mut dimensions = Dimensions::default();
         let mut in_sheet_data = false;
         let mut pre_buf = Vec::with_capacity(1024);
@@ -281,7 +315,7 @@ impl XlsxStreamReader {
         path: &Path,
         sheet_name: Option<&str>,
         sheet_idx: Option<usize>,
-    ) -> Result<(Vec<String>, String, Vec<u32>, HashSet<u32>)> {
+    ) -> Result<(Vec<Box<str>>, String, Vec<u32>, HashSet<u32>)> {
         let file = std::fs::File::open(path)?;
         let reader = BufReader::new(file);
         let mut archive = ZipArchive::new(reader)?;
@@ -310,15 +344,11 @@ impl XlsxStreamReader {
 
     fn read_rels<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<HashMap<String, String>> {
         let mut rels = HashMap::new();
-        let mut file = match archive.by_name("xl/_rels/workbook.xml.rels") {
+        let file = match archive.by_name("xl/_rels/workbook.xml.rels") {
             Ok(f) => f,
             Err(_) => return Ok(rels),
         };
-        let mut data = Vec::new();
-        file.read_to_end(&mut data)?;
-        drop(file);
-
-        let mut reader = Reader::from_reader(Cursor::new(data));
+        let mut reader = Reader::from_reader(BufReader::with_capacity(64 * 1024, file));
         let mut buf = Vec::new();
         loop {
             buf.clear();
@@ -358,14 +388,10 @@ impl XlsxStreamReader {
         archive: &mut ZipArchive<R>,
         rels: &HashMap<String, String>,
     ) -> Result<OrderdSheets> {
-        let mut file = archive
+        let file = archive
             .by_name("xl/workbook.xml")
             .context("workbook.xml not found")?;
-        let mut data = Vec::new();
-        file.read_to_end(&mut data)?;
-        drop(file);
-
-        let mut reader = Reader::from_reader(Cursor::new(data));
+        let mut reader = Reader::from_reader(BufReader::with_capacity(64 * 1024, file));
         let mut buf = Vec::new();
         let mut sheets = OrderdSheets::new();
 
@@ -402,17 +428,13 @@ impl XlsxStreamReader {
         Ok(sheets)
     }
 
-    fn read_shared_strings<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<Vec<String>> {
-        let mut file = match archive.by_name("xl/sharedStrings.xml") {
+    fn read_shared_strings<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<Vec<Box<str>>> {
+        let file = match archive.by_name("xl/sharedStrings.xml") {
             Ok(f) => f,
             Err(_) => return Ok(Vec::new()),
         };
-        let mut data = Vec::new();
-        file.read_to_end(&mut data)?;
-        drop(file);
-
         let mut strings = Vec::new();
-        let mut reader = Reader::from_reader(Cursor::new(data));
+        let mut reader = Reader::from_reader(BufReader::with_capacity(256 * 1024, file));
         let mut buf = Vec::new();
         let mut in_si = false;
         let mut current_text = String::new();
@@ -426,7 +448,7 @@ impl XlsxStreamReader {
                 }
                 Ok(Event::End(e)) if e.local_name().as_ref() == b"si" => {
                     in_si = false;
-                    strings.push(current_text.clone());
+                    strings.push(std::mem::take(&mut current_text).into_boxed_str());
                 }
                 Ok(Event::Start(e)) if e.local_name().as_ref() == b"t" && in_si => {
                     let mut text_buf = Vec::new();
@@ -460,15 +482,11 @@ impl XlsxStreamReader {
     fn read_styles<R: Read + Seek>(
         archive: &mut ZipArchive<R>,
     ) -> Result<(Vec<u32>, HashSet<u32>)> {
-        let mut file = match archive.by_name("xl/styles.xml") {
+        let file = match archive.by_name("xl/styles.xml") {
             Ok(f) => f,
             Err(_) => return Ok((Vec::new(), HashSet::new())),
         };
-        let mut data = Vec::new();
-        file.read_to_end(&mut data)?;
-        drop(file);
-
-        let mut reader = Reader::from_reader(Cursor::new(data));
+        let mut reader = Reader::from_reader(BufReader::with_capacity(64 * 1024, file));
         let mut buf = Vec::new();
         let mut cell_xfs: Vec<u32> = Vec::new();
         let mut custom_date_numfmts: HashSet<u32> = HashSet::new();
@@ -559,8 +577,7 @@ impl XlsxStreamReader {
                     value = self
                         .strings
                         .get(idx)
-                        .cloned()
-                        .map(Data::String)
+                        .map(|s| Data::String(s.to_string()))
                         .unwrap_or(Data::Empty);
                 }
             }
@@ -602,6 +619,7 @@ impl crate::stream_reader::StreamReader for XlsxStreamReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
     // #[global_allocator]
     // static ALLOC: dhat::Alloc = dhat::Alloc;
     #[test]

@@ -15,6 +15,7 @@ def read_xlsx(
     sheet_name: Optional[str] = None,
     sheet_idx: Optional[int] = None,
     has_header: bool = True,
+    reader: str = "default",
 ) -> XlsxReader:
     """打开 xlsx 文件，返回惰性迭代器。
 
@@ -24,6 +25,7 @@ def read_xlsx(
         sheet_name: 工作表名称（可选）。
         sheet_idx: 工作表索引，从 0 开始（可选）。
         has_header: 是否将第一行作为表头，默认 True。
+        reader: 读取器类型，"default" 或 "lm"，默认 "default"。
 
     返回:
         XlsxReader: 可迭代的 DataFrame 生成器。

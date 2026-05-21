@@ -20,3 +20,13 @@ dhat-heap.json
 test_data.csv
 test_100w_60c.xlsx
 */**/target
+scripts/
+bench.py
+benchmark_results.csv
+benchmark_timeseries.json
+zip_xml_analysis.md
+zip_xml_feasibility.md
+benchmark_plots/
+benchmark_python_plots/
+benchmark_python.csv
+benchmark_python.json

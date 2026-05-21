@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
     branches: [main]
 
@@ -43,7 +44,7 @@ jobs:
         run: cargo build --release
 
       - name: Upload CLI artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: project_x-cli-${{ runner.os }}
           path: target/release/project_x
@@ -69,7 +70,43 @@ jobs:
           maturin build --release
 
       - name: Upload wheel artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: stream_xlsx_py-wheel-${{ runner.os }}
-          path: target/wheels/*.whl
+          path: stream_xlsx_py/target/wheels/*.whl
+
+  release:
+    runs-on: fc-ci
+    needs: [build-cli, build-wheel]
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download CLI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: project_x-cli-${{ runner.os }}
+          path: ./artifacts/cli
+
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: stream_xlsx_py-wheel-${{ runner.os }}
+          path: ./artifacts/wheel
+
+      - name: Rename CLI for release
+        run: |
+          mkdir -p ./release
+          cp ./artifacts/cli/project_x ./release/project_x-${{ runner.os }}
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ./release/project_x-*
+            ./artifacts/wheel/*.whl
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

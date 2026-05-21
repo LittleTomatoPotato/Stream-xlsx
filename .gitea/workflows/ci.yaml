@@ -43,7 +43,7 @@ jobs:
         run: cargo build --release
 
       - name: Upload CLI artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: project_x-cli-${{ runner.os }}
           path: target/release/project_x
@@ -63,16 +63,13 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Install maturin
-        run: pip install maturin
-
       - name: Build Python wheel (release)
         run: |
           cd stream_xlsx_py
           maturin build --release
 
       - name: Upload wheel artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: stream_xlsx_py-wheel-${{ runner.os }}
           path: target/wheels/*.whl

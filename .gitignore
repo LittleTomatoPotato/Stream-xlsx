@@ -30,3 +30,4 @@ benchmark_plots/
 benchmark_python_plots/
 benchmark_python.csv
 benchmark_python.json
+test_data.parquet

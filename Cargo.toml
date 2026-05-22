@@ -9,7 +9,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-polars = { version = "0.53.0", features = ["csv"] }
+polars = { version = "0.53.0", features = ["csv", "parquet"] }
 rust_xlsxwriter = "0.84"
 rand = "0.9"
 anyhow = "1.0.102"

@@ -25,5 +25,9 @@ def polars_read():
 
 
 if __name__ == "__main__":
-    main()
-    polars_read()
+    # main()
+    # polars_read()
+    import polars as pl
+
+    df = pl.read_parquet("test_data.parquet")
+    print(df)

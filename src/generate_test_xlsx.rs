@@ -1,6 +1,6 @@
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use rust_xlsxwriter::{ExcelDateTime, Workbook};
+use rust_xlsxwriter::{ExcelDateTime, Format, Workbook};
 
 pub fn generate(
     path: &std::path::PathBuf,
@@ -11,6 +11,7 @@ pub fn generate(
 
     let mut workbook = Workbook::new();
     let worksheet = workbook.add_worksheet();
+    let date_format = Format::new().set_num_format("yyyy-mm-dd hh:mm:ss");
     let addition_cols = col.saturating_sub(7).max(0);
 
     // 写入表头：对应 calamine 常见的 DataType 类别
@@ -60,7 +61,7 @@ pub fn generate(
             year, month, day, hour, minute, second
         );
         let dt = ExcelDateTime::parse_from_str(&dt_str)?;
-        worksheet.write_datetime(r, 4, &dt)?;
+        worksheet.write_datetime_with_format(r, 4, &dt, &date_format)?;
 
         // 6. DurationIso (以字符串形式存储，calamine 会识别为 DurationIso)
         let h = rng.random_range(0..100);

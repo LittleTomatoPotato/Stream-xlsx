@@ -266,7 +266,10 @@ impl XlsxStreamReader {
                                 .and_then(|idx| self.cell_xfs.get(idx))
                                 .map(|&id| self.is_date_numfmt(id))
                                 .unwrap_or(false);
-                            self.date_columns[col_idx] = Some(result);
+                            // 只在有 s 属性的单元格上缓存，避免无 s 属性的单元格（如 header）把列锁死
+                            if s_attr_usize.is_some() {
+                                self.date_columns[col_idx] = Some(result);
+                            }
                             result
                         }
                     };

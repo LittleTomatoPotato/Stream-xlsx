@@ -1,4 +1,4 @@
-from typing import Iterator, Optional
+from typing import Iterator, Literal, Optional
 
 import polars as pl
 
@@ -11,11 +11,11 @@ class XlsxReader(Iterator[pl.DataFrame]):
 
 def read_xlsx(
     path: str,
-    batch_size: int = 10000,
+    batch_size: Optional[int] = 10000,
     sheet_name: Optional[str] = None,
     sheet_idx: Optional[int] = None,
     has_header: bool = True,
-    reader: str = "default",
+    reader: Literal["default", "lm"] = "default",
 ) -> XlsxReader:
     """打开 xlsx 文件，返回惰性迭代器。
 

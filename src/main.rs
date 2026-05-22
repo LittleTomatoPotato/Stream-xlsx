@@ -1,5 +1,5 @@
 use clap::{CommandFactory, Parser};
-use project_x::*;
+use sxlsx::*;
 
 fn main() {
     let args = Args::parse();

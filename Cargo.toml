@@ -4,16 +4,14 @@ default-members = [".", "stream_xlsx"]
 resolver = "2"
 
 [package]
-name = "project_x"
+name = "sxlsx"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-calamine = "0.35.0"
 polars = { version = "0.53.0", features = ["csv"] }
 rust_xlsxwriter = "0.84"
 rand = "0.9"
-chrono = "0.4"
 anyhow = "1.0.102"
 stream_xlsx = { path = "stream_xlsx" }
 clap = { version = "4.6.1", features = ["derive"] }

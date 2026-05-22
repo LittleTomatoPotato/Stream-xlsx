@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
-chrono = "0.4"
 polars = "0.53.0"
 quick-xml = "0.39"
 zip = "2"

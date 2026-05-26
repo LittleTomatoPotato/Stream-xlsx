@@ -1,16 +1,12 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-    tags: ["v*"]
-  pull_request:
-    branches: [main]
+  release:
+    types: [published]
 
 jobs:
   build-cli:
     runs-on: fc-ci
-    needs: test-rust
     steps:
       - uses: actions/checkout@v4
 
@@ -34,7 +30,6 @@ jobs:
 
   build-wheel:
     runs-on: fc-ci
-    needs: test-rust
     steps:
       - uses: actions/checkout@v4
 

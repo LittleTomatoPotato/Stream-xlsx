@@ -7,6 +7,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build-cli:
     strategy:
@@ -25,7 +28,7 @@ jobs:
           - os: windows-latest
             target: aarch64-pc-windows-msvc
             suffix: windows-arm64
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             suffix: macos-amd64
           - os: macos-latest
@@ -90,7 +93,7 @@ jobs:
           - os: windows-latest
             target: x86_64
             suffix: windows-amd64
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64
             suffix: macos-amd64
           - os: macos-latest

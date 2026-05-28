@@ -11,14 +11,6 @@ dependencies = [
     "polars>=1.40.1",
 ]
 
-[build-system]
-requires = ["maturin>=1.0,<2.0"]
-build-backend = "maturin"
-
-[tool.maturin]
-manifest-path = "stream_xlsx_py/Cargo.toml"
-module-name = "stream_xlsx"
-
 [tool.uv.workspace]
 members = [
     "project_x/stream_xlsx_py",

@@ -1,0 +1,15 @@
+[project]
+name = "stream-xlsx"
+dynamic = ["version"]
+description = "流式 xlsx 读取器，基于 quick-xml + zip 实现真正的流式解析"
+readme = "../README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+module-name = "stream_xlsx_py"
+manifest-path = "Cargo.toml"

@@ -8,7 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 stream_xlsx = { path = "../stream_xlsx" }
-pyo3 = { version = "0.27", features = ["extension-module"] }
+pyo3 = { version = "0.27", features = ["extension-module", "abi3-py39"] }
 pyo3-polars = "0.26"
 
 [package.metadata.maturin]

@@ -98,6 +98,7 @@ jobs:
           - os: windows-latest
             target: aarch64
             suffix: windows-arm64
+            interpreter: "-i 3.9"
           - os: macos-15-intel
             target: x86_64
             suffix: macos-amd64
@@ -113,7 +114,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release
+          args: --release ${{ matrix.interpreter || '' }}
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
           working-directory: stream_xlsx_py

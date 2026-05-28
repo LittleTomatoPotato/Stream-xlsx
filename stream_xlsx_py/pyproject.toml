@@ -1,5 +1,5 @@
 [project]
-name = "stream-xlsx"
+name = "stream-xlsx-py"
 dynamic = ["version"]
 description = "流式 xlsx 读取器，基于 quick-xml + zip 实现真正的流式解析"
 readme = "../README.md"

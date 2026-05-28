@@ -2,78 +2,82 @@ name: CI
 
 on:
   push:
+    branches: [main]
     tags:
       - "v*"
+  pull_request:
+    branches: [main]
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  RUST_BACKTRACE: 1
 
 jobs:
-  build-cli:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            suffix: linux-amd64
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            suffix: linux-arm64
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            suffix: windows-amd64
-          - os: windows-latest
-            target: aarch64-pc-windows-msvc
-            suffix: windows-arm64
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            suffix: macos-amd64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            suffix: macos-arm64
-
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Cache Cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ matrix.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build CLI
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Package CLI (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/sxlsx dist/sxlsx-${{ matrix.suffix }}
-          chmod +x dist/sxlsx-${{ matrix.suffix }}
-
-      - name: Package CLI (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/sxlsx.exe" "dist/sxlsx-${{ matrix.suffix }}.exe"
-
-      - name: Upload CLI artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: sxlsx-cli-${{ matrix.suffix }}
-          path: dist/*
+  # build-cli:
+  #   strategy:
+  #     fail-fast: false
+  #     matrix:
+  #       include:
+  #         - os: ubuntu-latest
+  #           target: x86_64-unknown-linux-gnu
+  #           suffix: linux-amd64
+  #         - os: ubuntu-24.04-arm
+  #           target: aarch64-unknown-linux-gnu
+  #           suffix: linux-arm64
+  #         - os: windows-latest
+  #           target: x86_64-pc-windows-msvc
+  #           suffix: windows-amd64
+  #         - os: windows-latest
+  #           target: aarch64-pc-windows-msvc
+  #           suffix: windows-arm64
+  #         - os: macos-15-intel
+  #           target: x86_64-apple-darwin
+  #           suffix: macos-amd64
+  #         - os: macos-latest
+  #           target: aarch64-apple-darwin
+  #           suffix: macos-arm64
+  #
+  #   runs-on: ${{ matrix.os }}
+  #   steps:
+  #     - uses: actions/checkout@v5
+  #
+  #     - name: Install Rust
+  #       uses: dtolnay/rust-toolchain@stable
+  #       with:
+  #         targets: ${{ matrix.target }}
+  #
+  #     - name: Cache Cargo
+  #       uses: actions/cache@v5
+  #       with:
+  #         path: |
+  #           ~/.cargo/registry
+  #           ~/.cargo/git
+  #           target
+  #         key: ${{ matrix.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+  #
+  #     - name: Build CLI
+  #       run: cargo build --release --target ${{ matrix.target }}
+  #
+  #     - name: Package CLI (Unix)
+  #       if: runner.os != 'Windows'
+  #       shell: bash
+  #       run: |
+  #         mkdir -p dist
+  #         cp target/${{ matrix.target }}/release/sxlsx dist/sxlsx-${{ matrix.suffix }}
+  #         chmod +x dist/sxlsx-${{ matrix.suffix }}
+  #
+  #     - name: Package CLI (Windows)
+  #       if: runner.os == 'Windows'
+  #       shell: pwsh
+  #       run: |
+  #         New-Item -ItemType Directory -Force -Path dist | Out-Null
+  #         Copy-Item "target/${{ matrix.target }}/release/sxlsx.exe" "dist/sxlsx-${{ matrix.suffix }}.exe"
+  #
+  #     - name: Upload CLI artifact
+  #       uses: actions/upload-artifact@v7
+  #       with:
+  #         name: sxlsx-cli-${{ matrix.suffix }}
+  #         path: dist/*
 
   build-wheel:
     strategy:
@@ -91,6 +95,9 @@ jobs:
           - os: windows-latest
             target: x86_64
             suffix: windows-amd64
+          - os: windows-11-arm
+            target: aarch64
+            suffix: windows-arm64
           - os: macos-15-intel
             target: x86_64
             suffix: macos-amd64
@@ -100,7 +107,37 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
+      - name: Setup build environment (ARM64 Windows)
+        if: matrix.os == 'windows-11-arm'
+        shell: powershell
+        run: |
+          Write-Output "> Setup bash.exe (git-for-windows/PortableGit)"
+          Invoke-WebRequest "https://github.com/git-for-windows/git/releases/download/v2.53.0.windows.2/PortableGit-2.53.0.2-arm64.7z.exe" -OutFile C:\git.7z.exe
+          C:\git.7z.exe -oC:\git -y
+
+          Write-Output "> Setup Rust"
+          Invoke-WebRequest "https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe" -OutFile C:\rustup-init.exe
+          C:\rustup-init.exe --default-host aarch64-pc-windows-msvc -y
+
+          Write-Output "> Setup VS Build Tools"
+          Invoke-WebRequest "https://aka.ms/vs/17/release/vs_BuildTools.exe" -OutFile C:\vs_BuildTools.exe
+          Start-Process C:\vs_BuildTools.exe -ArgumentList " `
+              --add Microsoft.VisualStudio.Workload.VCTools `
+              --add Microsoft.VisualStudio.Component.VC.Tools.arm64 `
+              --includeRecommended --quiet --norestart --wait" -Wait
+
+          Write-Output "> Update GITHUB_PATH"
+          [System.IO.File]::AppendAllText($Env:GITHUB_PATH, "`n" + "C:\git\bin\")
+          [System.IO.File]::AppendAllText($Env:GITHUB_PATH, "`n" + $Env:USERPROFILE + "\.cargo\bin\")
+          [System.IO.File]::AppendAllText($Env:GITHUB_PATH, "`n")
+
+      - name: Set up Python (ARM64 Windows)
+        if: matrix.os == 'windows-11-arm'
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
 
       - name: Build wheel
         uses: PyO3/maturin-action@v1
@@ -112,23 +149,26 @@ jobs:
           working-directory: stream_xlsx_py
 
       - name: Upload wheel artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheel-${{ matrix.suffix }}
           path: stream_xlsx_py/target/wheels/*.whl
 
   release:
+    if: github.event_name == 'push' && startsWith(github.ref_name, 'v')
     runs-on: ubuntu-latest
-    needs: [build-cli, build-wheel]
+    needs: [build-wheel]
+    permissions:
+      contents: write
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: ./artifacts
           merge-multiple: true
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: ./artifacts/**
           draft: false
@@ -139,6 +179,7 @@ jobs:
 
   publish-to-pypi:
     name: Publish to PyPI
+    if: github.event_name == 'push' && startsWith(github.ref_name, 'v') && github.event.base_ref == 'refs/heads/main'
     needs: [build-wheel]
     runs-on: ubuntu-latest
     environment:
@@ -148,7 +189,7 @@ jobs:
       id-token: write
     steps:
       - name: Download wheels
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true

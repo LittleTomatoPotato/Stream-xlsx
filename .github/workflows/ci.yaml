@@ -95,7 +95,7 @@ jobs:
           - os: windows-latest
             target: x86_64
             suffix: windows-amd64
-          - os: windows-11-arm
+          - os: windows-latest
             target: aarch64
             suffix: windows-arm64
           - os: macos-15-intel
@@ -108,36 +108,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
-
-      - name: Setup build environment (ARM64 Windows)
-        if: matrix.os == 'windows-11-arm'
-        shell: powershell
-        run: |
-          Write-Output "> Setup bash.exe (git-for-windows/PortableGit)"
-          Invoke-WebRequest "https://github.com/git-for-windows/git/releases/download/v2.53.0.windows.2/PortableGit-2.53.0.2-arm64.7z.exe" -OutFile C:\git.7z.exe
-          C:\git.7z.exe -oC:\git -y
-
-          Write-Output "> Setup Rust"
-          Invoke-WebRequest "https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe" -OutFile C:\rustup-init.exe
-          C:\rustup-init.exe --default-host aarch64-pc-windows-msvc -y
-
-          Write-Output "> Setup VS Build Tools"
-          Invoke-WebRequest "https://aka.ms/vs/17/release/vs_BuildTools.exe" -OutFile C:\vs_BuildTools.exe
-          Start-Process C:\vs_BuildTools.exe -ArgumentList " `
-              --add Microsoft.VisualStudio.Workload.VCTools `
-              --add Microsoft.VisualStudio.Component.VC.Tools.arm64 `
-              --includeRecommended --quiet --norestart --wait" -Wait
-
-          Write-Output "> Update GITHUB_PATH"
-          [System.IO.File]::AppendAllText($Env:GITHUB_PATH, "`n" + "C:\git\bin\")
-          [System.IO.File]::AppendAllText($Env:GITHUB_PATH, "`n" + $Env:USERPROFILE + "\.cargo\bin\")
-          [System.IO.File]::AppendAllText($Env:GITHUB_PATH, "`n")
-
-      - name: Set up Python (ARM64 Windows)
-        if: matrix.os == 'windows-11-arm'
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.11"
 
       - name: Build wheel
         uses: PyO3/maturin-action@v1

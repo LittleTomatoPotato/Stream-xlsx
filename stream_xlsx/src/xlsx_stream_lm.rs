@@ -107,6 +107,7 @@ impl XlsxStreamReader {
         sheet_name: Option<&str>,
         sheet_idx: Option<usize>,
     ) -> Result<Self> {
+        workbook.init()?;
         let sheet_path = match (sheet_name, sheet_idx) {
             (Some(name), _) => workbook
                 .sheet_path_by_name(name)
@@ -207,9 +208,9 @@ impl XlsxStreamReader {
 
         Ok(Self {
             xml,
-            strings: Arc::clone(workbook.strings()),
-            cell_xfs: Arc::clone(workbook.cell_xfs()),
-            custom_date_numfmts: Arc::clone(workbook.custom_date_numfmts()),
+            strings: Arc::clone(workbook.strings().unwrap()),
+            cell_xfs: Arc::clone(workbook.cell_xfs().unwrap()),
+            custom_date_numfmts: Arc::clone(workbook.custom_date_numfmts().unwrap()),
             date_columns: Vec::new(),
             row_index: 0,
             col_index: 0,

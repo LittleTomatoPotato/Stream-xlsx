@@ -5,16 +5,16 @@ use quick_xml::events::Event;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use zip::ZipArchive;
 
-/// 工作簿级共享数据，解析一次后可复用于多个 sheet 的读取。
+/// 工作簿级共享数据，解析 sheet 列表立即完成，strings/styles 惰性加载。
 #[derive(Debug)]
 pub struct XlsxWorkbook {
     path: PathBuf,
-    strings: Arc<Vec<Box<str>>>,
-    cell_xfs: Arc<Vec<u32>>,
-    custom_date_numfmts: Arc<HashSet<u32>>,
+    strings: OnceLock<Arc<Vec<Box<str>>>>,
+    cell_xfs: OnceLock<Arc<Vec<u32>>>,
+    custom_date_numfmts: OnceLock<Arc<HashSet<u32>>>,
     sheets: OrderdSheets,
 }
 
@@ -27,32 +27,48 @@ impl XlsxWorkbook {
 
         let rels = Self::read_rels(&mut archive)?;
         let sheets = Self::read_workbook_sheets(&mut archive, &rels)?;
-        let strings = Arc::new(Self::read_shared_strings(&mut archive)?);
-        let (cell_xfs, custom_date_numfmts) = Self::read_styles(&mut archive)?;
 
         Ok(Self {
             path,
-            strings,
-            cell_xfs: Arc::new(cell_xfs),
-            custom_date_numfmts: Arc::new(custom_date_numfmts),
+            strings: OnceLock::new(),
+            cell_xfs: OnceLock::new(),
+            custom_date_numfmts: OnceLock::new(),
             sheets,
         })
+    }
+
+    /// 惰性加载 sharedStrings 和 styles。线程安全，只执行一次。
+    pub fn init(&self) -> Result<()> {
+        if self.strings.get().is_some() {
+            return Ok(());
+        }
+        let file = std::fs::File::open(&self.path)?;
+        let reader = BufReader::new(file);
+        let mut archive = ZipArchive::new(reader)?;
+
+        let strings = Arc::new(Self::read_shared_strings(&mut archive)?);
+        let (cell_xfs, custom_date_numfmts) = Self::read_styles(&mut archive)?;
+
+        let _ = self.strings.set(strings);
+        let _ = self.cell_xfs.set(Arc::new(cell_xfs));
+        let _ = self.custom_date_numfmts.set(Arc::new(custom_date_numfmts));
+        Ok(())
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    pub fn strings(&self) -> &Arc<Vec<Box<str>>> {
-        &self.strings
+    pub fn strings(&self) -> Option<&Arc<Vec<Box<str>>>> {
+        self.strings.get()
     }
 
-    pub fn cell_xfs(&self) -> &Arc<Vec<u32>> {
-        &self.cell_xfs
+    pub fn cell_xfs(&self) -> Option<&Arc<Vec<u32>>> {
+        self.cell_xfs.get()
     }
 
-    pub fn custom_date_numfmts(&self) -> &Arc<HashSet<u32>> {
-        &self.custom_date_numfmts
+    pub fn custom_date_numfmts(&self) -> Option<&Arc<HashSet<u32>>> {
+        self.custom_date_numfmts.get()
     }
 
     pub fn sheet_count(&self) -> usize {
@@ -72,7 +88,7 @@ impl XlsxWorkbook {
     }
 
     // ------------------------------------------------------------------
-    // internal helpers (moved from xlsx_stream_lm)
+    // internal helpers
     // ------------------------------------------------------------------
 
     fn read_rels<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<HashMap<String, String>> {

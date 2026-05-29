@@ -1,4 +1,4 @@
-use crate::{Args, ReaderType};
+use crate::Args;
 use clap::ValueEnum;
 
 use polars::prelude::*;
@@ -19,24 +19,13 @@ fn get_iter(
     sheet_idx: &usize,
 ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<polars::prelude::DataFrame>>>> {
     let iter: Box<dyn Iterator<Item = anyhow::Result<polars::prelude::DataFrame>>> =
-        match args.reader {
-            ReaderType::Default => Box::new(df_iter::<
-                stream_xlsx::xlsx_stream_unsafe::XlsxStreamReader,
-            >(
-                args.batch_size,
-                path,
-                sheet_name.as_deref(),
-                Some(*sheet_idx),
-                true,
-            )?),
-            ReaderType::Lm => Box::new(df_iter::<stream_xlsx::xlsx_stream_lm::XlsxStreamReader>(
-                args.batch_size,
-                path,
-                sheet_name.as_deref(),
-                Some(*sheet_idx),
-                true,
-            )?),
-        };
+        Box::new(df_iter(
+            args.batch_size,
+            path,
+            sheet_name.as_deref(),
+            Some(*sheet_idx),
+            true,
+        )?);
     Ok(iter)
 }
 

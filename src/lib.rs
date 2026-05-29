@@ -25,14 +25,15 @@ pub struct Args {
     pub ignore_case: bool,
     #[arg(short, long, global = true)]
     pub ext: Option<String>,
+    /// (保留占位，reader 参数已移除)
     #[arg(
         short = 'R',
         long = "reader",
-        value_enum,
         default_value = "lm",
-        global = true
+        global = true,
+        hide = true
     )]
-    pub reader: ReaderType,
+    pub reader: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -69,12 +70,4 @@ pub enum Pattern {
         #[arg(value_enum)]
         shell: Option<clap_complete::Shell>,
     },
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, ValueEnum)]
-pub enum ReaderType {
-    /// 原实现
-    Default,
-    /// 优化实现（低内存）
-    Lm,
 }

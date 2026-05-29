@@ -602,13 +602,6 @@ impl XlsxStreamReader {
 }
 
 impl crate::stream_reader::StreamReader for XlsxStreamReader {
-    fn new<P: AsRef<Path>>(
-        path: P,
-        sheet_name: Option<&str>,
-        sheet_idx: Option<usize>,
-    ) -> anyhow::Result<Self> {
-        Self::new(path, sheet_name, sheet_idx)
-    }
     fn dimensions(&self) -> crate::excel_types::Dimensions {
         self.dimensions()
     }

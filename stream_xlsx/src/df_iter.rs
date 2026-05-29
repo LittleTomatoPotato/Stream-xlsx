@@ -1,6 +1,6 @@
 use crate::{
     excel_types::{Cell, Data, Dimensions},
-    stream_reader::StreamReader,
+    xlsx_stream_lm::XlsxStreamReader,
 };
 use polars::prelude::DataFrame;
 use polars::{
@@ -174,8 +174,8 @@ impl Cols<AnyValue<'static>> {
 ///
 /// 底层使用独立的 `XlsxStreamReader` 直接解压并解析 sheet XML，
 /// 不依赖 calamine 的任何内部类型。
-pub struct DataFrameIter<R: StreamReader> {
-    reader: R,
+pub struct DataFrameIter {
+    reader: XlsxStreamReader,
     cols: Cols<polars::prelude::AnyValue<'static>>,
     cell_cache: Option<Cell<Data>>,
     has_header: bool,
@@ -185,7 +185,7 @@ pub struct DataFrameIter<R: StreamReader> {
     last_processed_row: Option<u32>, // 上一个处理的绝对行号（检测行切换)
 }
 
-impl<R: StreamReader> DataFrameIter<R> {
+impl DataFrameIter {
     pub fn new<P>(
         batch_size: Option<usize>,
         path: P,
@@ -196,7 +196,7 @@ impl<R: StreamReader> DataFrameIter<R> {
     where
         P: AsRef<Path>,
     {
-        let reader = R::new(path, sheet_name, sheet_idx)?;
+        let reader = XlsxStreamReader::new(path, sheet_name, sheet_idx)?;
         let dim = reader.dimensions();
         let batch_size = match batch_size {
             Some(s) => s,
@@ -297,7 +297,7 @@ impl<R: StreamReader> DataFrameIter<R> {
     }
 }
 
-impl<R: StreamReader> Iterator for DataFrameIter<R> {
+impl Iterator for DataFrameIter {
     type Item = anyhow::Result<DataFrame>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -370,17 +370,17 @@ impl<R: StreamReader> Iterator for DataFrameIter<R> {
     }
 }
 
-impl<R: StreamReader> ExactSizeIterator for DataFrameIter<R> {}
+impl ExactSizeIterator for DataFrameIter {}
 
 /// 便捷函数：直接返回一个 DataFrame 迭代器
-pub fn df_iter<R: StreamReader>(
+pub fn df_iter(
     batch_size: Option<usize>,
     path: impl AsRef<Path>,
     sheet_name: Option<&str>,
     sheet_idx: Option<usize>,
     has_header: bool,
-) -> anyhow::Result<DataFrameIter<R>> {
-    DataFrameIter::<R>::new(batch_size, path, sheet_name, sheet_idx, has_header)
+) -> anyhow::Result<DataFrameIter> {
+    DataFrameIter::new(batch_size, path, sheet_name, sheet_idx, has_header)
 }
 
 #[cfg(test)]
@@ -393,13 +393,7 @@ mod tests {
             .parent()
             .unwrap()
             .join("test_data.xlsx");
-        let iter = df_iter::<crate::xlsx_stream_unsafe::XlsxStreamReader>(
-            10.into(),
-            &path,
-            "Sheet1".into(),
-            None,
-            true,
-        )?;
+        let iter = df_iter(10.into(), &path, "Sheet1".into(), None, true)?;
         let mut total_rows = 0;
         for (i, batch) in iter.enumerate() {
             let df = batch?;

@@ -32,3 +32,5 @@ benchmark_python.csv
 benchmark_python.json
 test_data.parquet
 test_data.xlsx
+.kimi/rules/codegraph.mdc
+.codegraph/.gitignore

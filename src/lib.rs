@@ -5,7 +5,7 @@ pub use transform::*;
 pub mod testmode;
 pub use testmode::*;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 pub use stream_xlsx;
 use stream_xlsx::df_iter::df_iter;
 

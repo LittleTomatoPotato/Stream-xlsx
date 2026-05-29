@@ -1,5 +1,6 @@
 use crate::{
     excel_types::{Cell, Data, Dimensions},
+    workbook::XlsxWorkbook,
     xlsx_stream_lm::XlsxStreamReader,
 };
 use polars::prelude::DataFrame;
@@ -10,7 +11,7 @@ use polars::{
     prelude::NamedFrom,
     series::Series,
 };
-use std::{path::Path, usize};
+use std::{path::Path, sync::Arc, usize};
 
 // 流式读取所需要的列
 #[derive(Debug)]
@@ -175,6 +176,7 @@ impl Cols<AnyValue<'static>> {
 /// 底层使用独立的 `XlsxStreamReader` 直接解压并解析 sheet XML，
 /// 不依赖 calamine 的任何内部类型。
 pub struct DataFrameIter {
+    workbook: Arc<XlsxWorkbook>,
     reader: XlsxStreamReader,
     cols: Cols<polars::prelude::AnyValue<'static>>,
     cell_cache: Option<Cell<Data>>,
@@ -183,6 +185,8 @@ pub struct DataFrameIter {
     batch_start_row: Option<u32>,    // 当前批次的起始绝对行号
     current_row_count: usize,        // 当前批次已收集的行数（用于批次截断）
     last_processed_row: Option<u32>, // 上一个处理的绝对行号（检测行切换)
+    current_sheet_name: Option<String>,
+    current_sheet_idx: Option<usize>,
 }
 
 impl DataFrameIter {
@@ -196,7 +200,18 @@ impl DataFrameIter {
     where
         P: AsRef<Path>,
     {
-        let reader = XlsxStreamReader::new(path, sheet_name, sheet_idx)?;
+        let workbook = Arc::new(XlsxWorkbook::open(path)?);
+        Self::from_workbook(batch_size, workbook, sheet_name, sheet_idx, has_header)
+    }
+
+    pub fn from_workbook(
+        batch_size: Option<usize>,
+        workbook: Arc<XlsxWorkbook>,
+        sheet_name: Option<&str>,
+        sheet_idx: Option<usize>,
+        has_header: bool,
+    ) -> anyhow::Result<Self> {
+        let reader = XlsxStreamReader::from_workbook(Arc::clone(&workbook), sheet_name, sheet_idx)?;
         let dim = reader.dimensions();
         let batch_size = match batch_size {
             Some(s) => s,
@@ -204,6 +219,7 @@ impl DataFrameIter {
         };
         let cols = Cols::new(&dim, batch_size);
         let mut iter = Self {
+            workbook,
             reader,
             cols,
             cell_cache: None,
@@ -212,10 +228,38 @@ impl DataFrameIter {
             batch_start_row: None,
             current_row_count: 0,
             last_processed_row: None,
+            current_sheet_name: sheet_name.map(|s| s.to_string()),
+            current_sheet_idx: sheet_idx,
         };
         iter.find_header(batch_size)?;
 
         Ok(iter)
+    }
+
+    pub fn workbook(&self) -> &Arc<XlsxWorkbook> {
+        &self.workbook
+    }
+
+    /// 切换到指定 sheet，重置所有解析状态。
+    pub fn select_sheet(
+        &mut self,
+        sheet_name: Option<&str>,
+        sheet_idx: Option<usize>,
+    ) -> anyhow::Result<()> {
+        self.reader =
+            XlsxStreamReader::from_workbook(Arc::clone(&self.workbook), sheet_name, sheet_idx)?;
+        let dim = self.reader.dimensions();
+        let batch_size = self.cols.batch_size;
+        self.cols = Cols::new(&dim, batch_size);
+        self.cell_cache = None;
+        self.batch_start_row = None;
+        self.current_row_count = 0;
+        self.last_processed_row = None;
+        self.current_sheet_name = sheet_name.map(|s| s.to_string());
+        self.current_sheet_idx = sheet_idx;
+        self.len = 0;
+        self.find_header(batch_size)?;
+        Ok(())
     }
 
     fn find_header(&mut self, batch_size: usize) -> anyhow::Result<()> {
@@ -404,6 +448,47 @@ mod tests {
             total_rows += df.height();
         }
         println!("total rows: {}", total_rows);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod multi_sheet_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_workbook_two_sheets() -> anyhow::Result<()> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("test_data.xlsx");
+        let wb = XlsxWorkbook::open(&path)?;
+        let names = wb.sheet_names();
+        assert_eq!(names.len(), 2);
+        assert_eq!(names[0], "Sheet1");
+        assert_eq!(names[1], "Sheet2");
+        Ok(())
+    }
+
+    #[test]
+    fn test_select_sheet() -> anyhow::Result<()> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("test_data.xlsx");
+        let wb = Arc::new(XlsxWorkbook::open(&path)?);
+        let mut iter = DataFrameIter::from_workbook(Some(5), Arc::clone(&wb), Some("Sheet1"), None, true)?;
+
+        let df1 = iter.next().unwrap()?;
+        let rows1 = df1.height();
+        println!("Sheet1 first batch: {} rows, cols: {:?}", rows1, df1.get_column_names());
+
+        iter.select_sheet(Some("Sheet2"), None)?;
+        let df2 = iter.next().unwrap()?;
+        let rows2 = df2.height();
+        println!("Sheet2 first batch: {} rows, cols: {:?}", rows2, df2.get_column_names());
+
         Ok(())
     }
 }

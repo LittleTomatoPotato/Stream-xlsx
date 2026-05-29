@@ -15,7 +15,7 @@ fn run_count<I>(start: std::time::Instant, df_iter: I)
 where
     I: Iterator<Item = anyhow::Result<polars::prelude::DataFrame>>,
 {
-    let mut count: usize = 1;
+    let mut count: usize = 0;
     df_iter.for_each(|df| {
         if df.is_ok() {
             count += 1;
@@ -91,7 +91,7 @@ pub fn test_parttern(
         _ => {}
     }
 
-    let df_iter = match df_iter(args.batch_size, path, None, 0.into(), true) {
+    let df_iter = match df_iter(args.batch_size, path, None, 0.into(), true, None) {
         Ok(a) => a,
         Err(e) => {
             println!("文件打开错误: {}, 输入路径:{:?}", e, path);

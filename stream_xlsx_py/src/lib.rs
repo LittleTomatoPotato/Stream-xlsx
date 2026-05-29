@@ -80,25 +80,28 @@ impl XlsxReader {
 ///     print(df.shape)
 /// ```
 #[pyfunction]
-#[pyo3(signature = (path, batch_size=10000, sheet_name=None, sheet_idx=None, has_header=true))]
+#[pyo3(signature = (path, batch_size=10000, sheet_name=None, sheet_idx=None, has_header=true, skip_rows=None))]
 fn read_xlsx(
     path: &str,
     batch_size: Option<usize>,
     sheet_name: Option<String>,
     sheet_idx: Option<usize>,
     has_header: bool,
+    skip_rows: Option<Vec<u32>>,
 ) -> PyResult<XlsxReader> {
     let workbook = Arc::new(
         XlsxWorkbook::open(path)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?,
     );
     let sheet_name_ref = sheet_name.as_deref();
+    let skip_rows_ref = skip_rows.as_deref();
     let iter = DataFrameIter::from_workbook(
         batch_size,
         Arc::clone(&workbook),
         sheet_name_ref,
         sheet_idx,
         has_header,
+        skip_rows_ref,
     )
     .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?;
     Ok(XlsxReader {

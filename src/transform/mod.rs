@@ -25,6 +25,7 @@ fn get_iter(
             sheet_name.as_deref(),
             Some(*sheet_idx),
             true,
+            None,
         )?);
     Ok(iter)
 }

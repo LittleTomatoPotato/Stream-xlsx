@@ -17,11 +17,9 @@ matplotlib.use("Agg")
 
 def run_benchmark(reader: str, batch_size: int, file: Path) -> dict:
     cmd = [
-        "./target/release/project_x",
+        "./target/release/sxlsx",
         "-B",
         str(batch_size),
-        "-R",
-        reader,
         "test",
         "count",
         str(file),
@@ -76,7 +74,7 @@ def run_benchmark(reader: str, batch_size: int, file: Path) -> dict:
 
 def plot_all(results: list, out_dir: Path):
     out_dir.mkdir(exist_ok=True)
-    readers = ["default", "lm"]
+    readers = ["lm"]
     colors = plt.cm.tab10
 
     # 1. Per-reader combined figure (all batch sizes on one plot)
@@ -109,6 +107,8 @@ def plot_all(results: list, out_dir: Path):
                 (r for r in results if r["reader"] == reader and r["batch_size"] == bs),
                 None,
             )
+            if not res:
+                continue
             if res:
                 ax.plot(
                     res["timestamps"],
@@ -117,7 +117,7 @@ def plot_all(results: list, out_dir: Path):
                     color=colors(r_idx),
                     linewidth=1.5,
                 )
-        ax.set_title(f"Memory Usage Over Time — Batch Size: {bs}")
+        ax.set_title(f"Memory Usage Over Time — Reader: lm, Batch Size: {bs}")
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("RSS (MB)")
         ax.legend(loc="upper right")
@@ -127,10 +127,10 @@ def plot_all(results: list, out_dir: Path):
         plt.close(fig)
 
     # 3. 2x6 grid: every condition gets its own mini-plot
-    fig, axes = plt.subplots(2, 6, figsize=(24, 8), sharey=True)
+    fig, axes = plt.subplots(1, 6, figsize=(24, 4), sharey=True)
     for r_idx, reader in enumerate(readers):
         for b_idx, bs in enumerate(batch_sizes):
-            ax = axes[r_idx][b_idx]
+            ax = axes[b_idx]
             res = next(
                 (r for r in results if r["reader"] == reader and r["batch_size"] == bs),
                 None,
@@ -159,7 +159,7 @@ def main():
         print(f"File not found: {file}")
         sys.exit(1)
 
-    readers = ["default", "lm"]
+    readers = ["lm"]
     batch_sizes = [1_000, 5_000, 10_000, 50_000, 100_000, 1_000_000]
     results = []
 
@@ -173,7 +173,7 @@ def main():
             status = "✅" if result["returncode"] == 0 else "❌"
             print(
                 f"    {status} batch={bs:>7}  time={result['elapsed_sec']:>6.2f}s  "
-                f"peak_mem={result['peak_rss_mb']:>8.1f}MB  rows={result['stdout']}"
+                f"peak_mem={result['peak_rss_mb']:>8.1f}MB  stdout={result["stdout"]}"
             )
             if result["stderr"]:
                 print(f"       stderr: {result['stderr']}")

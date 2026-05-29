@@ -67,10 +67,10 @@ def run_subprocess_test(name: str, code: str) -> dict:
     }
 
 
-def make_test_code_stream_xlsx(batch_size: int, reader: str) -> str:
+def make_test_code_stream_xlsx(batch_size: int) -> str:
     return f'''
 import stream_xlsx_py as sx
-for df in sx.read_xlsx("{TEST_FILE}", batch_size={batch_size}, reader="{reader}"):
+for df in sx.read_xlsx("{TEST_FILE}", batch_size={batch_size}):
     pass
 print("done")
 '''
@@ -93,17 +93,16 @@ def main():
 
     # 1. stream_xlsx_py 不同 reader / batch_size（含全量 1M）
     print("\n=== stream_xlsx_py ===")
-    for reader in ["default", "lm"]:
-        for bs in [10_000, 50_000, 100_000, 1_000_000]:
-            name = f"stream_xlsx_py reader={reader} batch={bs}"
-            code = make_test_code_stream_xlsx(bs, reader)
-            res = run_subprocess_test(name, code)
-            results.append(res)
-            print(
-                f"    {'✅' if res['returncode'] == 0 else '❌'} {name}: {res['elapsed_sec']:.2f}s  {res['peak_rss_mb']:.1f}MB"
-            )
-            if res["stderr"]:
-                print(f"       stderr: {res['stderr'][:200]}")
+    for bs in [10_000, 50_000, 100_000, 1_000_000]:
+        name = f"stream_xlsx_py batch={bs}"
+        code = make_test_code_stream_xlsx(bs)
+        res = run_subprocess_test(name, code)
+        results.append(res)
+        print(
+            f"    {'✅' if res['returncode'] == 0 else '❌'} {name}: {res['elapsed_sec']:.2f}s  {res['peak_rss_mb']:.1f}MB"
+        )
+        if res["stderr"]:
+            print(f"       stderr: {res['stderr'][:200]}")
 
     # 2. polars calamine
     print("\n=== polars calamine ===")

@@ -1,13 +1,16 @@
-from typing import Iterator, Literal, Optional
+from typing import Iterator, Optional
 
 import polars as pl
 
 class XlsxReader(Iterator[pl.DataFrame]):
-    """流式 xlsx 读取器，惰性逐批产生 DataFrame。"""
+    """流式 xlsx 读取器，惰性逐批产生 DataFrame。支持多 sheet 切换。"""
 
     def __iter__(self) -> "XlsxReader": ...
     def __next__(self) -> pl.DataFrame: ...
     def __len__(self) -> int: ...
+    def sheet_names(self) -> list[str]: ...
+    def select_sheet(self, sheet_name: str) -> None: ...
+    def select_sheet_by_idx(self, sheet_idx: int) -> None: ...
 
 def read_xlsx(
     path: str,
@@ -15,7 +18,7 @@ def read_xlsx(
     sheet_name: Optional[str] = None,
     sheet_idx: Optional[int] = None,
     has_header: bool = True,
-    reader: Literal["default", "lm"] = "default",
+    skip_rows: Optional[list[int]] = None,
 ) -> XlsxReader:
     """打开 xlsx 文件，返回惰性迭代器。
 
@@ -25,7 +28,7 @@ def read_xlsx(
         sheet_name: 工作表名称（可选）。
         sheet_idx: 工作表索引，从 0 开始（可选）。
         has_header: 是否将第一行作为表头，默认 True。
-        reader: 读取器类型，"default" 或 "lm"，默认 "default"。
+        skip_rows: 需要跳过的 0-based 行索引列表（可选）。
 
     返回:
         XlsxReader: 可迭代的 DataFrame 生成器。

@@ -5,6 +5,17 @@ description = "流式 xlsx 读取器，基于 quick-xml + zip 实现真正的流
 readme = "../README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
+dependencies = [
+    "polars>=1.0",
+]
+authors = [
+    { name = "LittleTomatoPotato", email = "349751674@qq.com" },
+]
+
+[project.urls]
+Homepage = "https://github.com/LittleTomatoPotato/Stream-xlsx"
+Repository = "https://github.com/LittleTomatoPotato/Stream-xlsx"
+Issues = "https://github.com/LittleTomatoPotato/Stream-xlsx/issues"
 
 [build-system]
 requires = ["maturin>=1.0,<2.0"]

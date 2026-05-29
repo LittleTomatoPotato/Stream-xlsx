@@ -31,6 +31,12 @@ impl OrderdSheets {
     pub fn get_by_idx(&self, idx: usize) -> Option<&String> {
         self.order.get(idx).map(|(_, path)| path)
     }
+    pub fn len(&self) -> usize {
+        self.order.len()
+    }
+    pub fn names(&self) -> Vec<&str> {
+        self.order.iter().map(|(name, _)| name.as_str()).collect()
+    }
 }
 
 pub fn is_date_format_code(code: &str) -> bool {

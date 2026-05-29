@@ -1,14 +1,15 @@
 /// 默认采用256KB作为内存切片的默认值, 后续可以考虑添加一个新的后台线程读取前N的块,记录最大值 暂时不做过度优化自动处理切片大小节省内存
 use crate::excel_types::{Cell, Data, Dimensions};
 use crate::utils::*;
-use anyhow::{Context, Result, anyhow};
+use crate::workbook::XlsxWorkbook;
+use anyhow::{Result, anyhow};
 use bytes::{Bytes, BytesMut};
 use quick_xml::Reader;
 use quick_xml::events::Event;
-use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Read, Seek};
+use std::collections::HashSet;
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
-use zip::ZipArchive;
+use std::sync::Arc;
 
 const CHUNK_SIZE: usize = 256 * 1024; // 256K
 const CHANNEL_CAPACITY: usize = 4;
@@ -76,9 +77,9 @@ impl BufRead for ChannelReader {
 /// 3. 主线程用 quick-xml 从 channel 上逐事件解析 `<row>` / `<c>`。
 pub struct XlsxStreamReader {
     xml: Reader<ChannelReader>,
-    strings: Vec<Box<str>>,
-    cell_xfs: Vec<u32>,
-    custom_date_numfmts: HashSet<u32>,
+    strings: Arc<Vec<Box<str>>>,
+    cell_xfs: Arc<Vec<u32>>,
+    custom_date_numfmts: Arc<HashSet<u32>>,
     date_columns: Vec<Option<bool>>,
     row_index: u32,
     col_index: u32,
@@ -90,21 +91,45 @@ pub struct XlsxStreamReader {
 }
 
 impl XlsxStreamReader {
+    /// 便捷方法：一次性打开文件并读取指定 sheet（向后兼容）。
     pub fn new<P: AsRef<Path>>(
         path: P,
         sheet_name: Option<&str>,
         sheet_idx: Option<usize>,
     ) -> Result<Self> {
-        let path = path.as_ref().to_owned();
-        let (strings, sheet_path, cell_xfs, custom_date_numfmts) =
-            Self::prepare(&path, sheet_name, sheet_idx)?;
+        let workbook = XlsxWorkbook::open(path)?;
+        Self::from_workbook(Arc::new(workbook), sheet_name, sheet_idx)
+    }
 
+    /// 从已有的 workbook 创建 sheet 读取器（支持多 sheet 切换）。
+    pub fn from_workbook(
+        workbook: Arc<XlsxWorkbook>,
+        sheet_name: Option<&str>,
+        sheet_idx: Option<usize>,
+    ) -> Result<Self> {
+        workbook.init()?;
+        let sheet_path = match (sheet_name, sheet_idx) {
+            (Some(name), _) => workbook
+                .sheet_path_by_name(name)
+                .ok_or_else(|| anyhow!("Worksheet '{}' not found", name))?
+                .to_string(),
+            (None, Some(idx)) => workbook
+                .sheet_path_by_idx(idx)
+                .ok_or_else(|| anyhow!("Worksheet idx '{}' not found", idx))?
+                .to_string(),
+            (None, None) => workbook
+                .sheet_path_by_idx(0)
+                .ok_or_else(|| anyhow!("Worksheet idx '0' not found"))?
+                .to_string(),
+        };
+
+        let path = workbook.path().to_owned();
         let (tx, rx) = std::sync::mpsc::sync_channel::<Bytes>(CHANNEL_CAPACITY);
         std::thread::spawn(move || {
             let send_result = (|| -> Result<()> {
                 let file = std::fs::File::open(&path)?;
                 let reader = BufReader::new(file);
-                let mut archive = ZipArchive::new(reader)?;
+                let mut archive = zip::ZipArchive::new(reader)?;
                 let mut zip_file = archive.by_name(&sheet_path)?;
                 let mut accumulate = BytesMut::with_capacity(CHUNK_SIZE * 2);
                 let mut temp = BytesMut::with_capacity(CHUNK_SIZE);
@@ -183,9 +208,9 @@ impl XlsxStreamReader {
 
         Ok(Self {
             xml,
-            strings,
-            cell_xfs,
-            custom_date_numfmts,
+            strings: Arc::clone(workbook.strings().unwrap()),
+            cell_xfs: Arc::clone(workbook.cell_xfs().unwrap()),
+            custom_date_numfmts: Arc::clone(workbook.custom_date_numfmts().unwrap()),
             date_columns: Vec::new(),
             row_index: 0,
             col_index: 0,
@@ -314,233 +339,6 @@ impl XlsxStreamReader {
         }
     }
 
-    fn prepare(
-        path: &Path,
-        sheet_name: Option<&str>,
-        sheet_idx: Option<usize>,
-    ) -> Result<(Vec<Box<str>>, String, Vec<u32>, HashSet<u32>)> {
-        let file = std::fs::File::open(path)?;
-        let reader = BufReader::new(file);
-        let mut archive = ZipArchive::new(reader)?;
-
-        let rels = Self::read_rels(&mut archive)?;
-        let sheet_targets = Self::read_workbook_sheets(&mut archive, &rels)?;
-        let sheet_path = match (sheet_name, sheet_idx) {
-            (Some(name), _) => sheet_targets
-                .get_by_name(name)
-                .ok_or_else(|| anyhow!("Worksheet '{}' not found", name))?
-                .clone(),
-            (None, Some(idx)) => sheet_targets
-                .get_by_idx(idx)
-                .ok_or_else(|| anyhow!("Worksheet idx '{}' not found", idx))?
-                .clone(),
-            (None, None) => sheet_targets
-                .get_by_idx(0)
-                .ok_or_else(|| anyhow!("Worksheet idx '0' not found"))?
-                .clone(),
-        };
-        let strings = Self::read_shared_strings(&mut archive)?;
-        let (cell_xfs, custom_date_numfmts) = Self::read_styles(&mut archive)?;
-
-        Ok((strings, sheet_path, cell_xfs, custom_date_numfmts))
-    }
-
-    fn read_rels<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<HashMap<String, String>> {
-        let mut rels = HashMap::new();
-        let file = match archive.by_name("xl/_rels/workbook.xml.rels") {
-            Ok(f) => f,
-            Err(_) => return Ok(rels),
-        };
-        let mut reader = Reader::from_reader(BufReader::with_capacity(64 * 1024, file));
-        let mut buf = Vec::new();
-        loop {
-            buf.clear();
-            match reader.read_event_into(&mut buf) {
-                Ok(Event::Empty(e)) | Ok(Event::Start(e))
-                    if e.local_name().as_ref() == b"Relationship" =>
-                {
-                    let mut id = String::new();
-                    let mut target = String::new();
-                    for attr in e.attributes() {
-                        let attr = attr?;
-                        match attr.key.as_ref() {
-                            b"Id" => id = String::from_utf8_lossy(&attr.value).into_owned(),
-                            b"Target" => target = String::from_utf8_lossy(&attr.value).into_owned(),
-                            _ => {}
-                        }
-                    }
-                    if !id.is_empty() {
-                        let path = if target.starts_with('/') {
-                            target[1..].to_string()
-                        } else {
-                            format!("xl/{}", target)
-                        };
-                        rels.insert(id, path);
-                    }
-                }
-                Ok(Event::End(e)) if e.local_name().as_ref() == b"Relationships" => break,
-                Ok(Event::Eof) => break,
-                Err(e) => return Err(anyhow!("XML error in rels: {}", e)),
-                _ => {}
-            }
-        }
-        Ok(rels)
-    }
-
-    fn read_workbook_sheets<R: Read + Seek>(
-        archive: &mut ZipArchive<R>,
-        rels: &HashMap<String, String>,
-    ) -> Result<OrderdSheets> {
-        let file = archive
-            .by_name("xl/workbook.xml")
-            .context("workbook.xml not found")?;
-        let mut reader = Reader::from_reader(BufReader::with_capacity(64 * 1024, file));
-        let mut buf = Vec::new();
-        let mut sheets = OrderdSheets::new();
-
-        loop {
-            buf.clear();
-            match reader.read_event_into(&mut buf) {
-                Ok(Event::Empty(e)) | Ok(Event::Start(e))
-                    if e.local_name().as_ref() == b"sheet" =>
-                {
-                    let mut name = String::new();
-                    let mut id = String::new();
-                    for attr in e.attributes() {
-                        let attr = attr?;
-                        match attr.key.local_name().as_ref() {
-                            b"name" => {
-                                name = reader.decoder().decode(&attr.value)?.into_owned();
-                            }
-                            b"id" => {
-                                id = String::from_utf8_lossy(&attr.value).into_owned();
-                            }
-                            _ => {}
-                        }
-                    }
-                    if let Some(path) = rels.get(&id) {
-                        sheets.insert(name, path.clone());
-                    }
-                }
-                Ok(Event::End(e)) if e.local_name().as_ref() == b"workbook" => break,
-                Ok(Event::Eof) => break,
-                Err(e) => return Err(anyhow!("XML error in workbook: {}", e)),
-                _ => {}
-            }
-        }
-        Ok(sheets)
-    }
-
-    fn read_shared_strings<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<Vec<Box<str>>> {
-        let file = match archive.by_name("xl/sharedStrings.xml") {
-            Ok(f) => f,
-            Err(_) => return Ok(Vec::new()),
-        };
-        let mut strings = Vec::new();
-        let mut reader = Reader::from_reader(BufReader::with_capacity(256 * 1024, file));
-        let mut buf = Vec::new();
-        let mut in_si = false;
-        let mut current_text = String::new();
-
-        loop {
-            buf.clear();
-            match reader.read_event_into(&mut buf) {
-                Ok(Event::Start(e)) if e.local_name().as_ref() == b"si" => {
-                    in_si = true;
-                    current_text.clear();
-                }
-                Ok(Event::End(e)) if e.local_name().as_ref() == b"si" => {
-                    in_si = false;
-                    strings.push(std::mem::take(&mut current_text).into_boxed_str());
-                }
-                Ok(Event::Start(e)) if e.local_name().as_ref() == b"t" && in_si => {
-                    let mut text_buf = Vec::new();
-                    loop {
-                        text_buf.clear();
-                        match reader.read_event_into(&mut text_buf) {
-                            Ok(Event::Text(t)) => {
-                                current_text.push_str(&t.xml10_content().unwrap_or_default());
-                            }
-                            Ok(Event::CData(t)) => {
-                                current_text.push_str(&String::from_utf8_lossy(t.as_ref()));
-                            }
-                            Ok(Event::End(e)) if e.local_name().as_ref() == b"t" => break,
-                            Ok(Event::Eof) => {
-                                return Err(anyhow!("Unexpected EOF in shared string"));
-                            }
-                            Err(e) => return Err(anyhow!("XML error in shared string: {}", e)),
-                            _ => {}
-                        }
-                    }
-                }
-                Ok(Event::End(e)) if e.local_name().as_ref() == b"sst" => break,
-                Ok(Event::Eof) => break,
-                Err(e) => return Err(anyhow!("XML error in shared strings: {}", e)),
-                _ => {}
-            }
-        }
-        Ok(strings)
-    }
-
-    fn read_styles<R: Read + Seek>(
-        archive: &mut ZipArchive<R>,
-    ) -> Result<(Vec<u32>, HashSet<u32>)> {
-        let file = match archive.by_name("xl/styles.xml") {
-            Ok(f) => f,
-            Err(_) => return Ok((Vec::new(), HashSet::new())),
-        };
-        let mut reader = Reader::from_reader(BufReader::with_capacity(64 * 1024, file));
-        let mut buf = Vec::new();
-        let mut cell_xfs: Vec<u32> = Vec::new();
-        let mut custom_date_numfmts: HashSet<u32> = HashSet::new();
-        let mut in_cell_xfs = false;
-        let mut in_num_fmts = false;
-
-        loop {
-            buf.clear();
-            match reader.read_event_into(&mut buf) {
-                Ok(Event::Start(e)) if e.local_name().as_ref() == b"numFmts" => {
-                    in_num_fmts = true;
-                }
-                Ok(Event::End(e)) if e.local_name().as_ref() == b"numFmts" => {
-                    in_num_fmts = false;
-                }
-                Ok(Event::Empty(e)) | Ok(Event::Start(e))
-                    if in_num_fmts && e.local_name().as_ref() == b"numFmt" =>
-                {
-                    if let Some(id_str) = get_attribute(&e, b"numFmtId")? {
-                        if let Ok(id) = id_str.parse::<u32>() {
-                            if let Some(code) = get_attribute(&e, b"formatCode")? {
-                                if is_date_format_code(&code) {
-                                    custom_date_numfmts.insert(id);
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(Event::Start(e)) if e.local_name().as_ref() == b"cellXfs" => {
-                    in_cell_xfs = true;
-                }
-                Ok(Event::End(e)) if e.local_name().as_ref() == b"cellXfs" => {
-                    in_cell_xfs = false;
-                }
-                Ok(Event::Empty(e)) | Ok(Event::Start(e))
-                    if in_cell_xfs && e.local_name().as_ref() == b"xf" =>
-                {
-                    let num_fmt_id = get_attribute(&e, b"numFmtId")?
-                        .and_then(|s| s.parse::<u32>().ok())
-                        .unwrap_or(0);
-                    cell_xfs.push(num_fmt_id);
-                }
-                Ok(Event::End(e)) if e.local_name().as_ref() == b"styleSheet" => break,
-                Ok(Event::Eof) => break,
-                Err(e) => return Err(anyhow!("XML error in styles: {}", e)),
-                _ => {}
-            }
-        }
-        Ok((cell_xfs, custom_date_numfmts))
-    }
-
     fn is_date_numfmt(&self, num_fmt_id: u32) -> bool {
         crate::utils::is_date_numfmt(num_fmt_id, &self.custom_date_numfmts)
     }
@@ -602,13 +400,6 @@ impl XlsxStreamReader {
 }
 
 impl crate::stream_reader::StreamReader for XlsxStreamReader {
-    fn new<P: AsRef<Path>>(
-        path: P,
-        sheet_name: Option<&str>,
-        sheet_idx: Option<usize>,
-    ) -> anyhow::Result<Self> {
-        Self::new(path, sheet_name, sheet_idx)
-    }
     fn dimensions(&self) -> crate::excel_types::Dimensions {
         self.dimensions()
     }
@@ -622,7 +413,6 @@ impl crate::stream_reader::StreamReader for XlsxStreamReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
     // #[global_allocator]
     // static ALLOC: dhat::Alloc = dhat::Alloc;
     #[test]
@@ -653,113 +443,12 @@ mod tests {
     }
 
     #[test]
-    fn prepare_test() -> Result<()> {
-        fn read_rels<R: Read + Seek>(
-            archive: &mut ZipArchive<R>,
-        ) -> Result<HashMap<String, String>> {
-            let mut rels = HashMap::new();
-            let mut file = match archive.by_name("xl/_rels/workbook.xml.rels") {
-                Ok(f) => f,
-                Err(_) => return Ok(rels),
-            };
-            let mut data = Vec::new();
-            file.read_to_end(&mut data)?;
-            drop(file);
-
-            let mut reader = Reader::from_reader(Cursor::new(data));
-            let mut buf = Vec::new();
-            loop {
-                buf.clear();
-                match reader.read_event_into(&mut buf) {
-                    Ok(Event::Empty(e)) | Ok(Event::Start(e))
-                        if e.local_name().as_ref() == b"Relationship" =>
-                    {
-                        let mut id = String::new();
-                        let mut target = String::new();
-                        for attr in e.attributes() {
-                            let attr = attr?;
-                            match attr.key.as_ref() {
-                                b"Id" => id = String::from_utf8_lossy(&attr.value).into_owned(),
-                                b"Target" => {
-                                    target = String::from_utf8_lossy(&attr.value).into_owned()
-                                }
-                                _ => {}
-                            }
-                        }
-                        if !id.is_empty() {
-                            let path = if target.starts_with('/') {
-                                target[1..].to_string()
-                            } else {
-                                format!("xl/{}", target)
-                            };
-                            rels.insert(id, path);
-                        }
-                    }
-                    Ok(Event::End(e)) if e.local_name().as_ref() == b"Relationships" => break,
-                    Ok(Event::Eof) => break,
-                    Err(e) => return Err(anyhow!("XML error in rels: {}", e)),
-                    _ => {}
-                }
-            }
-            Ok(rels)
-        }
-        fn read_workbook_sheets<R: Read + Seek>(
-            archive: &mut ZipArchive<R>,
-            rels: &HashMap<String, String>,
-        ) -> Result<OrderdSheets> {
-            let mut file = archive
-                .by_name("xl/workbook.xml")
-                .context("workbook.xml not found")?;
-            let mut data = Vec::new();
-            file.read_to_end(&mut data)?;
-            drop(file);
-
-            let mut reader = Reader::from_reader(Cursor::new(data));
-            let mut buf = Vec::new();
-            let mut sheets = OrderdSheets::new();
-
-            loop {
-                buf.clear();
-                match reader.read_event_into(&mut buf) {
-                    Ok(Event::Empty(e)) | Ok(Event::Start(e))
-                        if e.local_name().as_ref() == b"sheet" =>
-                    {
-                        let mut name = String::new();
-                        let mut id = String::new();
-                        for attr in e.attributes() {
-                            let attr = attr?;
-                            match attr.key.local_name().as_ref() {
-                                b"name" => {
-                                    name = reader.decoder().decode(&attr.value)?.into_owned();
-                                }
-                                b"id" => {
-                                    id = String::from_utf8_lossy(&attr.value).into_owned();
-                                }
-                                _ => {}
-                            }
-                        }
-                        if let Some(path) = rels.get(&id) {
-                            sheets.insert(name, path.clone());
-                        }
-                    }
-                    Ok(Event::End(e)) if e.local_name().as_ref() == b"workbook" => break,
-                    Ok(Event::Eof) => break,
-                    Err(e) => return Err(anyhow!("XML error in workbook: {}", e)),
-                    _ => {}
-                }
-            }
-            Ok(sheets)
-        }
-
+    fn workbook_open_test() -> Result<()> {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../test_data.xlsx");
         println!("{:?}", path);
-        let file = std::fs::File::open(path)?;
-        let reader = BufReader::new(file);
-        let mut archive = ZipArchive::new(reader)?;
-
-        let rels = read_rels(&mut archive)?;
-        let sheet_targets = read_workbook_sheets(&mut archive, &rels)?;
-        println!("{:?}", sheet_targets);
+        let wb = XlsxWorkbook::open(&path)?;
+        println!("sheet names: {:?}", wb.sheet_names());
+        println!("sheet count: {}", wb.sheet_count());
         Ok(())
     }
 }

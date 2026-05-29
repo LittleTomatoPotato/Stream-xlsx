@@ -1,6 +1,7 @@
 use crate::{
     excel_types::{Cell, Data, Dimensions},
-    stream_reader::StreamReader,
+    workbook::XlsxWorkbook,
+    xlsx_stream_lm::XlsxStreamReader,
 };
 use polars::prelude::DataFrame;
 use polars::{
@@ -10,7 +11,7 @@ use polars::{
     prelude::NamedFrom,
     series::Series,
 };
-use std::{path::Path, usize};
+use std::{collections::HashSet, path::Path, sync::Arc, usize};
 
 // 流式读取所需要的列
 #[derive(Debug)]
@@ -174,8 +175,9 @@ impl Cols<AnyValue<'static>> {
 ///
 /// 底层使用独立的 `XlsxStreamReader` 直接解压并解析 sheet XML，
 /// 不依赖 calamine 的任何内部类型。
-pub struct DataFrameIter<R: StreamReader> {
-    reader: R,
+pub struct DataFrameIter {
+    workbook: Arc<XlsxWorkbook>,
+    reader: XlsxStreamReader,
     cols: Cols<polars::prelude::AnyValue<'static>>,
     cell_cache: Option<Cell<Data>>,
     has_header: bool,
@@ -183,27 +185,45 @@ pub struct DataFrameIter<R: StreamReader> {
     batch_start_row: Option<u32>,    // 当前批次的起始绝对行号
     current_row_count: usize,        // 当前批次已收集的行数（用于批次截断）
     last_processed_row: Option<u32>, // 上一个处理的绝对行号（检测行切换)
+    current_sheet_name: Option<String>,
+    current_sheet_idx: Option<usize>,
+    skip_rows: HashSet<u32>,         // 需要跳过的 0-based 行索引
 }
 
-impl<R: StreamReader> DataFrameIter<R> {
+impl DataFrameIter {
     pub fn new<P>(
         batch_size: Option<usize>,
         path: P,
         sheet_name: Option<&str>,
         sheet_idx: Option<usize>,
         has_header: bool,
+        skip_rows: Option<&[u32]>,
     ) -> anyhow::Result<Self>
     where
         P: AsRef<Path>,
     {
-        let reader = R::new(path, sheet_name, sheet_idx)?;
+        let workbook = Arc::new(XlsxWorkbook::open(path)?);
+        Self::from_workbook(batch_size, workbook, sheet_name, sheet_idx, has_header, skip_rows)
+    }
+
+    pub fn from_workbook(
+        batch_size: Option<usize>,
+        workbook: Arc<XlsxWorkbook>,
+        sheet_name: Option<&str>,
+        sheet_idx: Option<usize>,
+        has_header: bool,
+        skip_rows: Option<&[u32]>,
+    ) -> anyhow::Result<Self> {
+        let reader = XlsxStreamReader::from_workbook(Arc::clone(&workbook), sheet_name, sheet_idx)?;
         let dim = reader.dimensions();
         let batch_size = match batch_size {
             Some(s) => s,
             None => dim.end.0 as usize + if has_header { 0 } else { 1 },
         };
         let cols = Cols::new(&dim, batch_size);
+        let skip_rows: HashSet<u32> = skip_rows.map(|s| s.iter().copied().collect()).unwrap_or_default();
         let mut iter = Self {
+            workbook,
             reader,
             cols,
             cell_cache: None,
@@ -212,10 +232,39 @@ impl<R: StreamReader> DataFrameIter<R> {
             batch_start_row: None,
             current_row_count: 0,
             last_processed_row: None,
+            current_sheet_name: sheet_name.map(|s| s.to_string()),
+            current_sheet_idx: sheet_idx,
+            skip_rows,
         };
         iter.find_header(batch_size)?;
 
         Ok(iter)
+    }
+
+    pub fn workbook(&self) -> &Arc<XlsxWorkbook> {
+        &self.workbook
+    }
+
+    /// 切换到指定 sheet，重置所有解析状态。
+    pub fn select_sheet(
+        &mut self,
+        sheet_name: Option<&str>,
+        sheet_idx: Option<usize>,
+    ) -> anyhow::Result<()> {
+        self.reader =
+            XlsxStreamReader::from_workbook(Arc::clone(&self.workbook), sheet_name, sheet_idx)?;
+        let dim = self.reader.dimensions();
+        let batch_size = self.cols.batch_size;
+        self.cols = Cols::new(&dim, batch_size);
+        self.cell_cache = None;
+        self.batch_start_row = None;
+        self.current_row_count = 0;
+        self.last_processed_row = None;
+        self.current_sheet_name = sheet_name.map(|s| s.to_string());
+        self.current_sheet_idx = sheet_idx;
+        self.len = 0;
+        self.find_header(batch_size)?;
+        Ok(())
     }
 
     fn find_header(&mut self, batch_size: usize) -> anyhow::Result<()> {
@@ -232,7 +281,7 @@ impl<R: StreamReader> DataFrameIter<R> {
             }
         };
         let first_x = first_cell.get_position().0;
-        let total_rows: usize;
+        let mut total_rows: usize;
         if self.has_header {
             self.cols.headers.push(first_cell.into());
             loop {
@@ -277,6 +326,10 @@ impl<R: StreamReader> DataFrameIter<R> {
                 .for_each(|(i, _)| self.cols.headers.push(format!("col_{}", i)));
             total_rows = (self.reader.dimensions().end.0 - first_x + 1) as usize;
         }
+        let skip_count = self.skip_rows.iter()
+            .filter(|&&r| r >= first_x && r <= self.reader.dimensions().end.0)
+            .count();
+        total_rows = total_rows.saturating_sub(skip_count);
         self.len = (total_rows + batch_size - 1) / batch_size;
         Ok(())
     }
@@ -297,32 +350,33 @@ impl<R: StreamReader> DataFrameIter<R> {
     }
 }
 
-impl<R: StreamReader> Iterator for DataFrameIter<R> {
+impl Iterator for DataFrameIter {
     type Item = anyhow::Result<DataFrame>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // 从缓存或 reader 获取当前批次的第一个 cell
-        if let Some(cell) = self.cell_cache.take() {
-            let cell_x = cell.get_position().0;
-            self.batch_start_row = Some(cell_x);
-            self.current_row_count = 1;
-            self.last_processed_row = Some(cell_x);
-            if let Err(e) = self.cols.push_cell(cell, 0) {
-                return Some(Err(e));
-            }
-        } else if self.batch_start_row.is_none() {
-            match self.reader.next_cell() {
-                Ok(Some(cell)) => {
-                    let cell_x = cell.get_position().0;
-                    self.batch_start_row = Some(cell_x);
-                    self.current_row_count = 1;
-                    self.last_processed_row = Some(cell_x);
-                    if let Err(e) = self.cols.push_cell(cell, 0) {
-                        return Some(Err(e));
+        // 获取第一个非跳过的 cell 作为 batch 起点
+        if self.batch_start_row.is_none() {
+            loop {
+                let cell = if let Some(c) = self.cell_cache.take() {
+                    c
+                } else {
+                    match self.reader.next_cell() {
+                        Ok(Some(c)) => c,
+                        Ok(None) => return None,
+                        Err(e) => return Some(Err(e)),
                     }
+                };
+                let row = cell.get_position().0;
+                if !self.skip_rows.is_empty() && self.skip_rows.contains(&row) {
+                    continue;
                 }
-                Ok(None) => return None,
-                Err(e) => return Some(Err(e)),
+                self.batch_start_row = Some(row);
+                self.current_row_count = 1;
+                self.last_processed_row = Some(row);
+                if let Err(e) = self.cols.push_cell(cell, 0) {
+                    return Some(Err(e));
+                }
+                break;
             }
         }
 
@@ -330,6 +384,11 @@ impl<R: StreamReader> Iterator for DataFrameIter<R> {
             match self.reader.next_cell() {
                 Ok(Some(cell)) => {
                     let current_row = cell.get_position().0;
+
+                    // 跳过整行：当前行在 skip_rows 中时，所有 cell 都丢弃
+                    if !self.skip_rows.is_empty() && self.skip_rows.contains(&current_row) {
+                        continue;
+                    }
 
                     if self.last_processed_row.map_or(true, |lr| lr != current_row) {
                         if self.current_row_count >= self.cols.batch_size {
@@ -341,13 +400,7 @@ impl<R: StreamReader> Iterator for DataFrameIter<R> {
                         self.last_processed_row = Some(current_row);
                     }
 
-                    let start_row = match self.batch_start_row {
-                        Some(r) => r,
-                        None => {
-                            return Some(Err(anyhow::anyhow!("batch_start_row lost mid-batch")));
-                        }
-                    };
-                    let batch_row = (current_row - start_row) as usize;
+                    let batch_row = self.current_row_count.saturating_sub(1) as usize;
                     if let Err(e) = self.cols.push_cell(cell, batch_row) {
                         return Some(Err(e));
                     }
@@ -370,17 +423,18 @@ impl<R: StreamReader> Iterator for DataFrameIter<R> {
     }
 }
 
-impl<R: StreamReader> ExactSizeIterator for DataFrameIter<R> {}
+impl ExactSizeIterator for DataFrameIter {}
 
 /// 便捷函数：直接返回一个 DataFrame 迭代器
-pub fn df_iter<R: StreamReader>(
+pub fn df_iter(
     batch_size: Option<usize>,
     path: impl AsRef<Path>,
     sheet_name: Option<&str>,
     sheet_idx: Option<usize>,
     has_header: bool,
-) -> anyhow::Result<DataFrameIter<R>> {
-    DataFrameIter::<R>::new(batch_size, path, sheet_name, sheet_idx, has_header)
+    skip_rows: Option<&[u32]>,
+) -> anyhow::Result<DataFrameIter> {
+    DataFrameIter::new(batch_size, path, sheet_name, sheet_idx, has_header, skip_rows)
 }
 
 #[cfg(test)]
@@ -393,13 +447,7 @@ mod tests {
             .parent()
             .unwrap()
             .join("test_data.xlsx");
-        let iter = df_iter::<crate::xlsx_stream_unsafe::XlsxStreamReader>(
-            10.into(),
-            &path,
-            "Sheet1".into(),
-            None,
-            true,
-        )?;
+        let iter = df_iter(10.into(), &path, "Sheet1".into(), None, true, None)?;
         let mut total_rows = 0;
         for (i, batch) in iter.enumerate() {
             let df = batch?;
@@ -410,6 +458,183 @@ mod tests {
             total_rows += df.height();
         }
         println!("total rows: {}", total_rows);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod multi_sheet_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_workbook_two_sheets() -> anyhow::Result<()> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("test_data.xlsx");
+        let wb = XlsxWorkbook::open(&path)?;
+        let names = wb.sheet_names();
+        assert_eq!(names.len(), 2);
+        assert_eq!(names[0], "Sheet1");
+        assert_eq!(names[1], "Sheet2");
+        Ok(())
+    }
+
+    #[test]
+    fn test_select_sheet() -> anyhow::Result<()> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("test_data.xlsx");
+        let wb = Arc::new(XlsxWorkbook::open(&path)?);
+        let mut iter = DataFrameIter::from_workbook(Some(5), Arc::clone(&wb), Some("Sheet1"), None, true, None)?;
+
+        let df1 = iter.next().unwrap()?;
+        let rows1 = df1.height();
+        println!("Sheet1 first batch: {} rows, cols: {:?}", rows1, df1.get_column_names());
+
+        iter.select_sheet(Some("Sheet2"), None)?;
+        let df2 = iter.next().unwrap()?;
+        let rows2 = df2.height();
+        println!("Sheet2 first batch: {} rows, cols: {:?}", rows2, df2.get_column_names());
+
+        Ok(())
+    }
+}
+
+
+#[cfg(test)]
+mod skip_rows_tests {
+    use super::*;
+
+    #[test]
+    fn test_skip_rows() -> anyhow::Result<()> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("test_data.xlsx");
+        // skip row 1 (second data row, 0-based)
+        let iter = df_iter(Some(100), &path, Some("Sheet1"), None, true, Some(&[1]))?;
+        let mut total_rows = 0;
+        for batch in iter {
+            let df = batch?;
+            total_rows += df.height();
+        }
+        // Without skip: test_data has header + 99999 data rows = 100000 total cells / 7 cols ≈ 14286 rows
+        // With skip row 1: one less data row
+        println!("total rows with skip: {}", total_rows);
+        assert!(total_rows > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_skip_rows_batch_boundary() -> anyhow::Result<()> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("test_data.xlsx");
+        // batch_size=5, skip row 1: row 1 is skipped before batch starts,
+        // so first batch reads raw rows 2,3,4,5,6 → outputs 5 rows
+        let iter = df_iter(Some(5), &path, Some("Sheet1"), None, true, Some(&[1]))?;
+        for (i, batch) in iter.enumerate() {
+            let df = batch?;
+            println!("batch {}: {} rows", i, df.height());
+            if i == 0 {
+                assert_eq!(df.height(), 5, "first batch should have 5 rows (row 1 skipped before batch)");
+            }
+            break;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_skip_rows_within_batch() -> anyhow::Result<()> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("test_data.xlsx");
+        // batch_size=5, skip rows 2,3,4: within batch, 3 rows skipped → output 2 rows
+        let iter = df_iter(Some(5), &path, Some("Sheet1"), None, true, Some(&[2, 3, 4]))?;
+        for (i, batch) in iter.enumerate() {
+            let df = batch?;
+            println!("batch {}: {} rows", i, df.height());
+            if i == 0 {
+                // Batch reads raw rows 1,2,3,4,5,6,7,8 (needs 5 valid rows)
+                // Skip 2,3,4. Valid: 1,5,6,7,8 → 5 rows
+                assert_eq!(df.height(), 5);
+            }
+            break;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod skip_header_interaction_tests {
+    use super::*;
+
+    #[test]
+    fn test_header_not_affected_by_skip() -> anyhow::Result<()> {
+        // Scenario 1: skip_rows=[1], header=row0
+        // Header should be read correctly, row1 skipped
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("test_data.xlsx");
+        let iter = df_iter(Some(5), &path, Some("Sheet1"), None, true, Some(&[1]))?;
+        let df = iter.into_iter().next().unwrap()?;
+        println!("Scenario 1 headers: {:?}", df.get_column_names());
+        println!("Scenario 1 first row: {:?}", df.get_row(0));
+        assert!(df.height() > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_skip_header_row_with_has_header_true() -> anyhow::Result<()> {
+        // Scenario 2: skip_rows=[0], has_header=true
+        // Row 0 becomes header (current behavior)
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("test_data.xlsx");
+        let iter = df_iter(Some(5), &path, Some("Sheet1"), None, true, Some(&[0]))?;
+        let df = iter.into_iter().next().unwrap()?;
+        println!("Scenario 2 headers: {:?}", df.get_column_names());
+        println!("Scenario 2 first row: {:?}", df.get_row(0));
+        // Headers are the content of row 0
+        Ok(())
+    }
+
+    #[test]
+    fn test_skip_first_data_row_no_header() -> anyhow::Result<()> {
+        // Scenario 3: has_header=false, skip_rows=[0]
+        // First data row (row 0) should be skipped
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("test_data.xlsx");
+        let iter = df_iter(Some(5), &path, Some("Sheet1"), None, false, Some(&[0]))?;
+        let df = iter.into_iter().next().unwrap()?;
+        println!("Scenario 3 headers: {:?}", df.get_column_names());
+        println!("Scenario 3 first row: {:?}", df.get_row(0));
+        assert!(df.height() > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_skip_second_row_no_header() -> anyhow::Result<()> {
+        // Scenario 4: has_header=false, skip_rows=[1]
+        // Row 0 is data, row 1 is skipped
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("test_data.xlsx");
+        let iter = df_iter(Some(5), &path, Some("Sheet1"), None, false, Some(&[1]))?;
+        let df = iter.into_iter().next().unwrap()?;
+        println!("Scenario 4 headers: {:?}", df.get_column_names());
+        println!("Scenario 4 first row: {:?}", df.get_row(0));
+        assert!(df.height() > 0);
         Ok(())
     }
 }

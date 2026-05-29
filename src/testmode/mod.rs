@@ -1,4 +1,4 @@
-use crate::{Args, ReaderType, df_iter, generate_test_xlsx};
+use crate::{Args, df_iter, generate_test_xlsx};
 use clap::ValueEnum;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, ValueEnum)]
@@ -15,7 +15,7 @@ fn run_count<I>(start: std::time::Instant, df_iter: I)
 where
     I: Iterator<Item = anyhow::Result<polars::prelude::DataFrame>>,
 {
-    let mut count: usize = 1;
+    let mut count: usize = 0;
     df_iter.for_each(|df| {
         if df.is_ok() {
             count += 1;
@@ -91,46 +91,16 @@ pub fn test_parttern(
         _ => {}
     }
 
-    match args.reader {
-        ReaderType::Default => {
-            let df_iter = match df_iter::<stream_xlsx::xlsx_stream_unsafe::XlsxStreamReader>(
-                args.batch_size,
-                path,
-                None,
-                0.into(),
-                true,
-            ) {
-                Ok(a) => a,
-                Err(e) => {
-                    println!("文件打开错误: {}, 输入路径:{:?}", e, path);
-                    return;
-                }
-            };
-            match parttern {
-                TestMod::Count => run_count(start, df_iter),
-                TestMod::Debug => run_debug(start, df_iter, no_limit),
-                _ => unreachable!(),
-            }
+    let df_iter = match df_iter(args.batch_size, path, None, 0.into(), true, None) {
+        Ok(a) => a,
+        Err(e) => {
+            println!("文件打开错误: {}, 输入路径:{:?}", e, path);
+            return;
         }
-        ReaderType::Lm => {
-            let df_iter = match df_iter::<stream_xlsx::xlsx_stream_lm::XlsxStreamReader>(
-                args.batch_size,
-                path,
-                None,
-                0.into(),
-                true,
-            ) {
-                Ok(a) => a,
-                Err(e) => {
-                    println!("文件打开错误: {}, 输入路径:{:?}", e, path);
-                    return;
-                }
-            };
-            match parttern {
-                TestMod::Count => run_count(start, df_iter),
-                TestMod::Debug => run_debug(start, df_iter, no_limit),
-                _ => unreachable!(),
-            }
-        }
+    };
+    match parttern {
+        TestMod::Count => run_count(start, df_iter),
+        TestMod::Debug => run_debug(start, df_iter, no_limit),
+        _ => unreachable!(),
     }
 }

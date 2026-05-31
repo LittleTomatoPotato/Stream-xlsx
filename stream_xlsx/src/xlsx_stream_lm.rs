@@ -4,6 +4,7 @@ use crate::utils::*;
 use crate::workbook::XlsxWorkbook;
 use anyhow::{Result, anyhow};
 use bytes::{Bytes, BytesMut};
+use polars::datatypes::PlSmallStr;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use std::collections::HashSet;
@@ -77,7 +78,7 @@ impl BufRead for ChannelReader {
 /// 3. 主线程用 quick-xml 从 channel 上逐事件解析 `<row>` / `<c>`。
 pub struct XlsxStreamReader {
     xml: Reader<ChannelReader>,
-    strings: Arc<Vec<Box<str>>>,
+    strings: Arc<Vec<PlSmallStr>>, 
     cell_xfs: Arc<Vec<u32>>,
     custom_date_numfmts: Arc<HashSet<u32>>,
     date_columns: Vec<Option<bool>>,

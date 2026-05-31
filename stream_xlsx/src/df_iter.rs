@@ -4,6 +4,7 @@ use crate::{
     xlsx_stream_lm::XlsxStreamReader,
 };
 use polars::prelude::*;
+use polars_arrow::array::{Array, MutablePlString, Utf8ViewArray};
 use polars_arrow::bitmap::{Bitmap, MutableBitmap};
 use std::{collections::HashSet, path::Path, sync::Arc};
 
@@ -16,7 +17,7 @@ pub enum TypedCol {
     Int64(Vec<i64>, MutableBitmap),
     Float64(Vec<f64>, MutableBitmap),
     Bool(Vec<bool>, MutableBitmap),
-    String(Vec<PlSmallStr>, MutableBitmap),
+    String(MutablePlString),
     DateTime(Vec<i64>, MutableBitmap), // nanoseconds
     AnyValue(Vec<AnyValue<'static>>),
     Empty,
@@ -28,7 +29,7 @@ impl TypedCol {
             DataType::Int64 => Self::Int64(Vec::with_capacity(capacity), MutableBitmap::with_capacity(capacity)),
             DataType::Float64 => Self::Float64(Vec::with_capacity(capacity), MutableBitmap::with_capacity(capacity)),
             DataType::Boolean => Self::Bool(Vec::with_capacity(capacity), MutableBitmap::with_capacity(capacity)),
-            DataType::String => Self::String(Vec::with_capacity(capacity), MutableBitmap::with_capacity(capacity)),
+            DataType::String => Self::String(MutablePlString::with_capacity(capacity)),
             DataType::Datetime(TimeUnit::Nanoseconds, None) => {
                 Self::DateTime(Vec::with_capacity(capacity), MutableBitmap::with_capacity(capacity))
             }
@@ -41,7 +42,7 @@ impl TypedCol {
             Self::Int64(v, _) => v.is_empty(),
             Self::Float64(v, _) => v.is_empty(),
             Self::Bool(v, _) => v.is_empty(),
-            Self::String(v, _) => v.is_empty(),
+            Self::String(v) => v.len() == 0,
             Self::DateTime(v, _) => v.is_empty(),
             Self::AnyValue(v) => v.is_empty(),
             Self::Empty => true,
@@ -53,7 +54,7 @@ impl TypedCol {
             Self::Int64(v, _) => v.len(),
             Self::Float64(v, _) => v.len(),
             Self::Bool(v, _) => v.len(),
-            Self::String(v, _) => v.len(),
+            Self::String(v) => v.len(),
             Self::DateTime(v, _) => v.len(),
             Self::AnyValue(v) => v.len(),
             Self::Empty => 0,
@@ -81,10 +82,9 @@ impl TypedCol {
                     bitmap.push(false);
                 }
             }
-            Self::String(vec, bitmap) => {
-                while vec.len() < target_len {
-                    vec.push(PlSmallStr::EMPTY);
-                    bitmap.push(false);
+            Self::String(arr) => {
+                while arr.len() < target_len {
+                    arr.push_null();
                 }
             }
             Self::DateTime(vec, bitmap) => {
@@ -108,7 +108,7 @@ impl TypedCol {
             Self::Int64(v, b) => { v.push(0); b.push(false); }
             Self::Float64(v, b) => { v.push(0.0); b.push(false); }
             Self::Bool(v, b) => { v.push(false); b.push(false); }
-            Self::String(v, b) => { v.push(PlSmallStr::EMPTY); b.push(false); }
+            Self::String(arr) => { arr.push_null(); }
             Self::DateTime(v, b) => { v.push(0); b.push(false); }
             Self::AnyValue(v) => { v.push(AnyValue::Null); }
             Self::Empty => {}
@@ -121,7 +121,7 @@ impl TypedCol {
             (Self::Int64(_, _), Data::Int(_)) => true,
             (Self::Float64(_, _), Data::Float(_) | Data::Int(_)) => true,
             (Self::Bool(_, _), Data::Bool(_)) => true,
-            (Self::String(_, _), Data::String(_) | Data::DateTimeIso(_) | Data::DurationIso(_)) => true,
+            (Self::String(_), Data::String(_) | Data::DateTimeIso(_) | Data::DurationIso(_)) => true,
             (Self::DateTime(_, _), Data::DateTime(_)) => true,
             (Self::AnyValue(_), _) => true,
             (_, Data::Empty | Data::Error(_)) => true,
@@ -151,15 +151,14 @@ impl TypedCol {
                     b.push(true);
                 }
             }
-            Self::String(v, b) => {
+            Self::String(arr) => {
                 let s = match data {
-                    Data::String(s) => PlSmallStr::from(s),
-                    Data::DateTimeIso(s) => PlSmallStr::from(s),
-                    Data::DurationIso(s) => PlSmallStr::from(s),
+                    Data::String(s) => s,
+                    Data::DateTimeIso(s) => s,
+                    Data::DurationIso(s) => s,
                     _ => return,
                 };
-                v.push(s);
-                b.push(true);
+                arr.push_value(&s);
             }
             Self::DateTime(v, b) => {
                 if let Data::DateTime(dt) = data {
@@ -185,23 +184,35 @@ impl TypedCol {
             }
             // Int64 → String
             (TypedCol::Int64(vec, bitmap), DataType::String) => {
-                let new_vec: Vec<PlSmallStr> = vec.into_iter().map(|v| PlSmallStr::from(v.to_string())).collect();
-                TypedCol::String(new_vec, bitmap)
+                let mut arr = MutablePlString::with_capacity(bitmap.len());
+                for (i, v) in vec.into_iter().enumerate() {
+                    if bitmap.get(i) { arr.push_value(&v.to_string()); } else { arr.push_null(); }
+                }
+                TypedCol::String(arr)
             }
             // Float64 → String
             (TypedCol::Float64(vec, bitmap), DataType::String) => {
-                let new_vec: Vec<PlSmallStr> = vec.into_iter().map(|v| PlSmallStr::from(v.to_string())).collect();
-                TypedCol::String(new_vec, bitmap)
+                let mut arr = MutablePlString::with_capacity(bitmap.len());
+                for (i, v) in vec.into_iter().enumerate() {
+                    if bitmap.get(i) { arr.push_value(&v.to_string()); } else { arr.push_null(); }
+                }
+                TypedCol::String(arr)
             }
             // Bool → String
             (TypedCol::Bool(vec, bitmap), DataType::String) => {
-                let new_vec: Vec<PlSmallStr> = vec.into_iter().map(|v| PlSmallStr::from(v.to_string())).collect();
-                TypedCol::String(new_vec, bitmap)
+                let mut arr = MutablePlString::with_capacity(bitmap.len());
+                for (i, v) in vec.into_iter().enumerate() {
+                    if bitmap.get(i) { arr.push_value(&v.to_string()); } else { arr.push_null(); }
+                }
+                TypedCol::String(arr)
             }
             // DateTime → String
             (TypedCol::DateTime(vec, bitmap), DataType::String) => {
-                let new_vec: Vec<PlSmallStr> = vec.into_iter().map(|v| PlSmallStr::from(v.to_string())).collect();
-                TypedCol::String(new_vec, bitmap)
+                let mut arr = MutablePlString::with_capacity(bitmap.len());
+                for (i, v) in vec.into_iter().enumerate() {
+                    if bitmap.get(i) { arr.push_value(&v.to_string()); } else { arr.push_null(); }
+                }
+                TypedCol::String(arr)
             }
             // 其他不兼容情况统一回退到 AnyValue
             (mut old, _) => {
@@ -225,10 +236,14 @@ impl TypedCol {
                             av_vec.push(if valid { AnyValue::Boolean(v) } else { AnyValue::Null });
                         }
                     }
-                    TypedCol::String(vec, bitmap) => {
-                        for (i, v) in vec.drain(..).enumerate() {
-                            let valid = bitmap.get(i);
-                            av_vec.push(if valid { AnyValue::StringOwned(v) } else { AnyValue::Null });
+                    TypedCol::String(arr) => {
+                        let frozen = std::mem::replace(arr, MutablePlString::with_capacity(0)).freeze();
+                        for i in 0..frozen.len() {
+                            if frozen.is_null(i) {
+                                av_vec.push(AnyValue::Null);
+                            } else {
+                                av_vec.push(AnyValue::StringOwned(PlSmallStr::from(frozen.value(i))));
+                            }
                         }
                     }
                     TypedCol::DateTime(vec, bitmap) => {
@@ -268,17 +283,9 @@ impl TypedCol {
                 );
                 Ok(unsafe { BooleanChunked::from_chunks(name, vec![Box::new(arr)]) }.into_series())
             }
-            (TypedCol::String(vec, bitmap), DataType::String) => {
-                let bitmap: Bitmap = bitmap.into();
-                let mut builder = StringChunkedBuilder::new(name, vec.len());
-                for (i, s) in vec.into_iter().enumerate() {
-                    if bitmap.get(i).unwrap() {
-                        builder.append_value(s.as_str());
-                    } else {
-                        builder.append_null();
-                    }
-                }
-                Ok(builder.finish().into_series())
+            (TypedCol::String(arr), DataType::String) => {
+                let arr: Utf8ViewArray = arr.freeze();
+                Ok(unsafe { StringChunked::from_chunks(name, vec![Box::new(arr)]) }.into_series())
             }
             (TypedCol::DateTime(vec, bitmap), DataType::Datetime(TimeUnit::Nanoseconds, None)) => {
                 let bitmap: Bitmap = bitmap.into();
@@ -308,9 +315,14 @@ impl TypedCol {
                             if bitmap.get(i) { av_vec.push(AnyValue::Boolean(v)); } else { av_vec.push(AnyValue::Null); }
                         }
                     }
-                    TypedCol::String(vec, bitmap) => {
-                        for (i, v) in vec.into_iter().enumerate() {
-                            if bitmap.get(i) { av_vec.push(AnyValue::StringOwned(v)); } else { av_vec.push(AnyValue::Null); }
+                    TypedCol::String(arr) => {
+                        let frozen = arr.freeze();
+                        for i in 0..frozen.len() {
+                            if frozen.is_null(i) {
+                                av_vec.push(AnyValue::Null);
+                            } else {
+                                av_vec.push(AnyValue::StringOwned(PlSmallStr::from(frozen.value(i))));
+                            }
                         }
                     }
                     TypedCol::DateTime(vec, bitmap) => {

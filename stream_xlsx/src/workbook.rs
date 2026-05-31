@@ -1,5 +1,6 @@
 use crate::utils::*;
 use anyhow::{Context, Result, anyhow};
+use polars::datatypes::PlSmallStr;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use std::collections::{HashMap, HashSet};
@@ -12,7 +13,7 @@ use zip::ZipArchive;
 #[derive(Debug)]
 pub struct XlsxWorkbook {
     path: PathBuf,
-    strings: OnceLock<Arc<Vec<Box<str>>>>,
+    strings: OnceLock<Arc<Vec<PlSmallStr>>>, 
     cell_xfs: OnceLock<Arc<Vec<u32>>>,
     custom_date_numfmts: OnceLock<Arc<HashSet<u32>>>,
     sheets: OrderdSheets,
@@ -59,7 +60,7 @@ impl XlsxWorkbook {
         &self.path
     }
 
-    pub fn strings(&self) -> Option<&Arc<Vec<Box<str>>>> {
+    pub fn strings(&self) -> Option<&Arc<Vec<PlSmallStr>>> {
         self.strings.get()
     }
 
@@ -177,7 +178,7 @@ impl XlsxWorkbook {
         Ok(sheets)
     }
 
-    fn read_shared_strings<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<Vec<Box<str>>> {
+    fn read_shared_strings<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<Vec<PlSmallStr>> {
         let file = match archive.by_name("xl/sharedStrings.xml") {
             Ok(f) => f,
             Err(_) => return Ok(Vec::new()),
@@ -197,7 +198,7 @@ impl XlsxWorkbook {
                 }
                 Ok(Event::End(e)) if e.local_name().as_ref() == b"si" => {
                     in_si = false;
-                    strings.push(std::mem::take(&mut current_text).into_boxed_str());
+                    strings.push(PlSmallStr::from_string(std::mem::take(&mut current_text)));
                 }
                 Ok(Event::Start(e)) if e.local_name().as_ref() == b"t" && in_si => {
                     let mut text_buf = Vec::new();

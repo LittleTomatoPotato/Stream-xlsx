@@ -3086,6 +3086,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "polars",
+ "polars-arrow",
  "quick-xml",
  "zip",
 ]

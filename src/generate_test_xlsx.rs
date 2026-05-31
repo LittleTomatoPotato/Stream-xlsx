@@ -10,7 +10,22 @@ pub fn generate(
     let path = path.as_path();
 
     let mut workbook = Workbook::new();
-    let worksheet = workbook.add_worksheet();
+    workbook.add_worksheet().set_name("Sheet1")?;
+    workbook.add_worksheet().set_name("Sheet2")?;
+
+    // 先完成 Sheet2 的所有操作
+    {
+        let sheet2 = workbook.worksheet_from_index(1).unwrap();
+        for col in 0..7 {
+            sheet2.write(0, col as u16, format!("S2_C{}", col))?;
+        }
+        for row in 1..=10 {
+            for col in 0..7 {
+                sheet2.write(row as u32, col as u16, format!("r{}c{}", row, col))?;
+            }
+        }
+    }
+
     let date_format = Format::new().set_num_format("yyyy-mm-dd hh:mm:ss");
     let addition_cols = col.saturating_sub(7).max(0);
 
@@ -24,6 +39,8 @@ pub fn generate(
         "DurationIso",
         "Empty",
     ];
+
+    let worksheet = workbook.worksheet_from_index(0).unwrap();
     for (col, header) in headers.iter().enumerate() {
         worksheet.write(0, col as u16, *header)?;
     }

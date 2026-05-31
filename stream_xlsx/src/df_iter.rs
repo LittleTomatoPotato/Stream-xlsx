@@ -3,42 +3,350 @@ use crate::{
     workbook::XlsxWorkbook,
     xlsx_stream_lm::XlsxStreamReader,
 };
-use polars::prelude::DataFrame;
-use polars::{
-    datatypes::{AnyValue, DataType, PlSmallStr, TimeUnit},
-    error::PolarsResult,
-    frame::column::Column,
-    prelude::NamedFrom,
-    series::Series,
-};
-use std::{collections::HashSet, path::Path, sync::Arc, usize};
+use polars::prelude::*;
+use polars_arrow::bitmap::{Bitmap, MutableBitmap};
+use std::{collections::HashSet, path::Path, sync::Arc};
 
-// 流式读取所需要的列
+// ------------------------------------------------------------------
+// TypedCol / TypedCols：按类型存储列数据，数值列实现零拷贝构建
+// ------------------------------------------------------------------
+
 #[derive(Debug)]
-pub struct Col<T> {
-    #[allow(dead_code)]
-    y: usize,
-    pub vec: Vec<T>,
+pub enum TypedCol {
+    Int64(Vec<i64>, MutableBitmap),
+    Float64(Vec<f64>, MutableBitmap),
+    Bool(Vec<bool>, MutableBitmap),
+    String(Vec<PlSmallStr>, MutableBitmap),
+    DateTime(Vec<i64>, MutableBitmap), // nanoseconds
+    AnyValue(Vec<AnyValue<'static>>),
+    Empty,
 }
 
-impl<T: FromData> Col<T> {
-    pub fn new(y: usize, capacity: usize) -> Self {
-        Self {
-            y,
-            vec: Vec::with_capacity(capacity),
+impl TypedCol {
+    pub fn new(dtype: &DataType, capacity: usize) -> Self {
+        match dtype {
+            DataType::Int64 => Self::Int64(Vec::with_capacity(capacity), MutableBitmap::with_capacity(capacity)),
+            DataType::Float64 => Self::Float64(Vec::with_capacity(capacity), MutableBitmap::with_capacity(capacity)),
+            DataType::Boolean => Self::Bool(Vec::with_capacity(capacity), MutableBitmap::with_capacity(capacity)),
+            DataType::String => Self::String(Vec::with_capacity(capacity), MutableBitmap::with_capacity(capacity)),
+            DataType::Datetime(TimeUnit::Nanoseconds, None) => {
+                Self::DateTime(Vec::with_capacity(capacity), MutableBitmap::with_capacity(capacity))
+            }
+            _ => Self::AnyValue(Vec::with_capacity(capacity)),
         }
     }
 
-    pub fn push_cell(&mut self, data: Data, batch_row: usize) {
-        let empty_num = (batch_row).saturating_sub(self.vec.len());
-        if empty_num > 0 {
-            self.vec
-                .extend(std::iter::repeat_with(|| T::from_data(Data::Empty)).take(empty_num));
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Int64(v, _) => v.is_empty(),
+            Self::Float64(v, _) => v.is_empty(),
+            Self::Bool(v, _) => v.is_empty(),
+            Self::String(v, _) => v.is_empty(),
+            Self::DateTime(v, _) => v.is_empty(),
+            Self::AnyValue(v) => v.is_empty(),
+            Self::Empty => true,
         }
-        self.vec.push(T::from_data(data));
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Int64(v, _) => v.len(),
+            Self::Float64(v, _) => v.len(),
+            Self::Bool(v, _) => v.len(),
+            Self::String(v, _) => v.len(),
+            Self::DateTime(v, _) => v.len(),
+            Self::AnyValue(v) => v.len(),
+            Self::Empty => 0,
+        }
+    }
+
+    /// 填充空值到目标长度（稀疏列补齐）
+    pub fn pad_to(&mut self, target_len: usize) {
+        match self {
+            Self::Int64(vec, bitmap) => {
+                while vec.len() < target_len {
+                    vec.push(0);
+                    bitmap.push(false);
+                }
+            }
+            Self::Float64(vec, bitmap) => {
+                while vec.len() < target_len {
+                    vec.push(0.0);
+                    bitmap.push(false);
+                }
+            }
+            Self::Bool(vec, bitmap) => {
+                while vec.len() < target_len {
+                    vec.push(false);
+                    bitmap.push(false);
+                }
+            }
+            Self::String(vec, bitmap) => {
+                while vec.len() < target_len {
+                    vec.push(PlSmallStr::EMPTY);
+                    bitmap.push(false);
+                }
+            }
+            Self::DateTime(vec, bitmap) => {
+                while vec.len() < target_len {
+                    vec.push(0);
+                    bitmap.push(false);
+                }
+            }
+            Self::AnyValue(vec) => {
+                while vec.len() < target_len {
+                    vec.push(AnyValue::Null);
+                }
+            }
+            Self::Empty => {}
+        }
+    }
+
+    /// 推入一个空值（用于稀疏补齐）
+    pub fn push_null(&mut self) {
+        match self {
+            Self::Int64(v, b) => { v.push(0); b.push(false); }
+            Self::Float64(v, b) => { v.push(0.0); b.push(false); }
+            Self::Bool(v, b) => { v.push(false); b.push(false); }
+            Self::String(v, b) => { v.push(PlSmallStr::EMPTY); b.push(false); }
+            Self::DateTime(v, b) => { v.push(0); b.push(false); }
+            Self::AnyValue(v) => { v.push(AnyValue::Null); }
+            Self::Empty => {}
+        }
+    }
+
+    /// 判断当前列是否能直接容纳该 Data（无需升级）
+    pub fn accepts(&self, data: &Data) -> bool {
+        match (self, data) {
+            (Self::Int64(_, _), Data::Int(_)) => true,
+            (Self::Float64(_, _), Data::Float(_) | Data::Int(_)) => true,
+            (Self::Bool(_, _), Data::Bool(_)) => true,
+            (Self::String(_, _), Data::String(_) | Data::DateTimeIso(_) | Data::DurationIso(_)) => true,
+            (Self::DateTime(_, _), Data::DateTime(_)) => true,
+            (Self::AnyValue(_), _) => true,
+            (_, Data::Empty | Data::Error(_)) => true,
+            _ => false,
+        }
+    }
+
+    /// 推入一个非空值（调用前必须保证 accepts() 为 true）
+    pub fn push_value(&mut self, data: Data) {
+        match self {
+            Self::Int64(v, b) => {
+                if let Data::Int(val) = data {
+                    v.push(val);
+                    b.push(true);
+                }
+            }
+            Self::Float64(v, b) => {
+                match data {
+                    Data::Float(val) => { v.push(val); b.push(true); }
+                    Data::Int(val) => { v.push(val as f64); b.push(true); }
+                    _ => {}
+                }
+            }
+            Self::Bool(v, b) => {
+                if let Data::Bool(val) = data {
+                    v.push(val);
+                    b.push(true);
+                }
+            }
+            Self::String(v, b) => {
+                let s = match data {
+                    Data::String(s) => PlSmallStr::from(s),
+                    Data::DateTimeIso(s) => PlSmallStr::from(s),
+                    Data::DurationIso(s) => PlSmallStr::from(s),
+                    _ => return,
+                };
+                v.push(s);
+                b.push(true);
+            }
+            Self::DateTime(v, b) => {
+                if let Data::DateTime(dt) = data {
+                    v.push(dt.to_timestamp_nanos());
+                    b.push(true);
+                }
+            }
+            Self::AnyValue(v) => {
+                v.push(data.into_anyvalue());
+            }
+            Self::Empty => {}
+        }
+    }
+
+    /// 类型升级（into_iter 转移所有权）
+    pub fn upgrade(&mut self, target: &DataType) {
+        let old = std::mem::replace(self, TypedCol::Empty);
+        *self = match (old, target) {
+            // Int64 → Float64
+            (TypedCol::Int64(vec, bitmap), DataType::Float64) => {
+                let new_vec: Vec<f64> = vec.into_iter().map(|v| v as f64).collect();
+                TypedCol::Float64(new_vec, bitmap)
+            }
+            // Int64 → String
+            (TypedCol::Int64(vec, bitmap), DataType::String) => {
+                let new_vec: Vec<PlSmallStr> = vec.into_iter().map(|v| PlSmallStr::from(v.to_string())).collect();
+                TypedCol::String(new_vec, bitmap)
+            }
+            // Float64 → String
+            (TypedCol::Float64(vec, bitmap), DataType::String) => {
+                let new_vec: Vec<PlSmallStr> = vec.into_iter().map(|v| PlSmallStr::from(v.to_string())).collect();
+                TypedCol::String(new_vec, bitmap)
+            }
+            // Bool → String
+            (TypedCol::Bool(vec, bitmap), DataType::String) => {
+                let new_vec: Vec<PlSmallStr> = vec.into_iter().map(|v| PlSmallStr::from(v.to_string())).collect();
+                TypedCol::String(new_vec, bitmap)
+            }
+            // DateTime → String
+            (TypedCol::DateTime(vec, bitmap), DataType::String) => {
+                let new_vec: Vec<PlSmallStr> = vec.into_iter().map(|v| PlSmallStr::from(v.to_string())).collect();
+                TypedCol::String(new_vec, bitmap)
+            }
+            // 其他不兼容情况统一回退到 AnyValue
+            (mut old, _) => {
+                let mut av_vec = Vec::with_capacity(old.len());
+                match &mut old {
+                    TypedCol::Int64(vec, bitmap) => {
+                        for (i, v) in vec.drain(..).enumerate() {
+                            let valid = bitmap.get(i);
+                            av_vec.push(if valid { AnyValue::Int64(v) } else { AnyValue::Null });
+                        }
+                    }
+                    TypedCol::Float64(vec, bitmap) => {
+                        for (i, v) in vec.drain(..).enumerate() {
+                            let valid = bitmap.get(i);
+                            av_vec.push(if valid { AnyValue::Float64(v) } else { AnyValue::Null });
+                        }
+                    }
+                    TypedCol::Bool(vec, bitmap) => {
+                        for (i, v) in vec.drain(..).enumerate() {
+                            let valid = bitmap.get(i);
+                            av_vec.push(if valid { AnyValue::Boolean(v) } else { AnyValue::Null });
+                        }
+                    }
+                    TypedCol::String(vec, bitmap) => {
+                        for (i, v) in vec.drain(..).enumerate() {
+                            let valid = bitmap.get(i);
+                            av_vec.push(if valid { AnyValue::StringOwned(v) } else { AnyValue::Null });
+                        }
+                    }
+                    TypedCol::DateTime(vec, bitmap) => {
+                        for (i, v) in vec.drain(..).enumerate() {
+                            let valid = bitmap.get(i);
+                            av_vec.push(if valid { AnyValue::Datetime(v, TimeUnit::Nanoseconds, None) } else { AnyValue::Null });
+                        }
+                    }
+                    TypedCol::AnyValue(vec) => {
+                        std::mem::swap(&mut av_vec, vec);
+                    }
+                    TypedCol::Empty => {}
+                }
+                TypedCol::AnyValue(av_vec)
+            }
+        };
+    }
+
+    /// 转换为 Polars Series
+    pub fn into_series(self, name: PlSmallStr, dtype: &DataType) -> PolarsResult<Series> {
+        match (self, dtype) {
+            (TypedCol::Int64(vec, bitmap), DataType::Int64) => {
+                let bitmap: Bitmap = bitmap.into();
+                Ok(Int64Chunked::from_vec_validity(name, vec, Some(bitmap)).into_series())
+            }
+            (TypedCol::Float64(vec, bitmap), DataType::Float64) => {
+                let bitmap: Bitmap = bitmap.into();
+                Ok(Float64Chunked::from_vec_validity(name, vec, Some(bitmap)).into_series())
+            }
+            (TypedCol::Bool(vec, bitmap), DataType::Boolean) => {
+                let validity: Bitmap = bitmap.into();
+                let values = Bitmap::from_iter(vec);
+                let arr = polars_arrow::array::BooleanArray::new(
+                    polars_arrow::datatypes::ArrowDataType::Boolean,
+                    values,
+                    Some(validity),
+                );
+                Ok(unsafe { BooleanChunked::from_chunks(name, vec![Box::new(arr)]) }.into_series())
+            }
+            (TypedCol::String(vec, bitmap), DataType::String) => {
+                let bitmap: Bitmap = bitmap.into();
+                let mut builder = StringChunkedBuilder::new(name, vec.len());
+                for (i, s) in vec.into_iter().enumerate() {
+                    if bitmap.get(i).unwrap() {
+                        builder.append_value(s.as_str());
+                    } else {
+                        builder.append_null();
+                    }
+                }
+                Ok(builder.finish().into_series())
+            }
+            (TypedCol::DateTime(vec, bitmap), DataType::Datetime(TimeUnit::Nanoseconds, None)) => {
+                let bitmap: Bitmap = bitmap.into();
+                Ok(Int64Chunked::from_vec_validity(name, vec, Some(bitmap))
+                    .into_datetime(TimeUnit::Nanoseconds, None)
+                    .into_series())
+            }
+            (TypedCol::AnyValue(vec), _) => {
+                Series::from_any_values_and_dtype(name, &vec, dtype, false)
+            }
+            (col, _) => {
+                // 类型不匹配时的降级处理：先转 AnyValue 再走老路
+                let mut av_vec = Vec::with_capacity(col.len());
+                match col {
+                    TypedCol::Int64(vec, bitmap) => {
+                        for (i, v) in vec.into_iter().enumerate() {
+                            if bitmap.get(i) { av_vec.push(AnyValue::Int64(v)); } else { av_vec.push(AnyValue::Null); }
+                        }
+                    }
+                    TypedCol::Float64(vec, bitmap) => {
+                        for (i, v) in vec.into_iter().enumerate() {
+                            if bitmap.get(i) { av_vec.push(AnyValue::Float64(v)); } else { av_vec.push(AnyValue::Null); }
+                        }
+                    }
+                    TypedCol::Bool(vec, bitmap) => {
+                        for (i, v) in vec.into_iter().enumerate() {
+                            if bitmap.get(i) { av_vec.push(AnyValue::Boolean(v)); } else { av_vec.push(AnyValue::Null); }
+                        }
+                    }
+                    TypedCol::String(vec, bitmap) => {
+                        for (i, v) in vec.into_iter().enumerate() {
+                            if bitmap.get(i) { av_vec.push(AnyValue::StringOwned(v)); } else { av_vec.push(AnyValue::Null); }
+                        }
+                    }
+                    TypedCol::DateTime(vec, bitmap) => {
+                        for (i, v) in vec.into_iter().enumerate() {
+                            if bitmap.get(i) { av_vec.push(AnyValue::Datetime(v, TimeUnit::Nanoseconds, None)); } else { av_vec.push(AnyValue::Null); }
+                        }
+                    }
+                    _ => {}
+                }
+                Series::from_any_values_and_dtype(name, &av_vec, dtype, false)
+            }
+        }
     }
 }
 
+// 辅助 trait：将 Data 转为 AnyValue（保留给 AnyValue 回退列和 header 解析使用）
+pub trait IntoAnyValue {
+    fn into_anyvalue(self) -> AnyValue<'static>;
+}
+
+impl IntoAnyValue for Data {
+    fn into_anyvalue(self) -> AnyValue<'static> {
+        match self {
+            Data::Int(v) => AnyValue::Int64(v),
+            Data::Float(v) => AnyValue::Float64(v),
+            Data::Bool(v) => AnyValue::Boolean(v),
+            Data::String(v) => AnyValue::StringOwned(PlSmallStr::from(v)),
+            Data::DateTime(v) => AnyValue::Datetime(v.to_timestamp_nanos(), TimeUnit::Nanoseconds, None),
+            Data::DateTimeIso(v) => AnyValue::StringOwned(PlSmallStr::from(v)),
+            Data::DurationIso(v) => AnyValue::StringOwned(PlSmallStr::from(v)),
+            Data::Error(_) | Data::Empty => AnyValue::Null,
+        }
+    }
+}
+
+// 保留 FromData trait（header 解析等场景仍需要）
 pub trait FromData: Sized {
     fn from_data(data: Data) -> Self;
 }
@@ -51,46 +359,51 @@ impl FromData for Data {
 
 impl FromData for AnyValue<'static> {
     fn from_data(data: Data) -> Self {
+        data.into_anyvalue()
+    }
+}
+
+impl FromData for String {
+    fn from_data(data: Data) -> Self {
         match data {
-            Data::Int(v) => AnyValue::Int64(v),
-            Data::Float(v) => AnyValue::Float64(v),
-            Data::Bool(v) => AnyValue::Boolean(v),
-            Data::String(v) => AnyValue::StringOwned(PlSmallStr::from(v)),
-            Data::DateTime(v) => {
-                AnyValue::Datetime(v.to_timestamp_nanos(), TimeUnit::Nanoseconds, None)
-            }
-            Data::DateTimeIso(v) => AnyValue::StringOwned(PlSmallStr::from(v)),
-            Data::DurationIso(v) => AnyValue::StringOwned(PlSmallStr::from(v)),
-            Data::Error(_) => AnyValue::Null,
-            Data::Empty => AnyValue::Null,
+            Data::String(s) => s,
+            Data::Int(i) => i.to_string(),
+            Data::Float(f) => f.to_string(),
+            Data::Bool(b) => b.to_string(),
+            Data::DateTime(dt) => dt.to_string(),
+            Data::DateTimeIso(s) | Data::DurationIso(s) => s,
+            Data::Error(e) => e.to_string(),
+            Data::Empty => String::new(),
         }
     }
 }
 
-/// 流式读取所需要的多个列名为 Cols
+/// 流式读取所需要的多个列
 #[derive(Debug)]
-pub struct Cols<T> {
-    pub vecs: Vec<Col<T>>,
+pub struct TypedCols {
+    pub cols: Vec<TypedCol>,
     pub batch_size: usize,
-    pub col_num: usize,
     pub headers: Vec<String>,
     pub col_dtypes: Vec<Option<DataType>>,
 }
 
-impl<T> Cols<T>
-where
-    T: FromData,
-{
+fn data_to_dtype(data: &Data) -> DataType {
+    match data {
+        Data::Int(_) => DataType::Int64,
+        Data::Float(_) => DataType::Float64,
+        Data::Bool(_) => DataType::Boolean,
+        Data::String(_) | Data::DateTimeIso(_) | Data::DurationIso(_) => DataType::String,
+        Data::DateTime(_) => DataType::Datetime(TimeUnit::Nanoseconds, None),
+        Data::Error(_) | Data::Empty => DataType::Null,
+    }
+}
+
+impl TypedCols {
     pub fn new(dimension: &Dimensions, batch_size: usize) -> Self {
         let col_num = dimension.end.1 as usize + 1;
-        let mut vecs: Vec<Col<T>> = Vec::with_capacity(col_num);
-        for i in 0..col_num {
-            vecs.push(Col::new(i, batch_size));
-        }
         Self {
-            vecs,
+            cols: (0..col_num).map(|_| TypedCol::Empty).collect(),
             batch_size,
-            col_num,
             headers: Vec::with_capacity(col_num),
             col_dtypes: vec![None; col_num],
         }
@@ -99,20 +412,57 @@ where
     pub fn push_cell(&mut self, cell: Cell<Data>, batch_row: usize) -> anyhow::Result<()> {
         let (_, y) = cell.get_position();
         let y = y as usize;
-        if y >= self.vecs.len() {
-            let start = self.vecs.len();
-            for i in start..=y {
-                self.vecs.push(Col::new(i, self.batch_size));
+
+        // 动态扩展列
+        if y >= self.cols.len() {
+            let start = self.cols.len();
+            for _ in start..=y {
+                self.cols.push(TypedCol::Empty);
                 self.col_dtypes.push(None);
             }
         }
-        // 边写边推断类型（必须在 get_mut 之前，避免重复可变借用）
-        self.infer_dtype(y, cell.get_value());
-        let col = self
-            .vecs
-            .get_mut(y)
-            .ok_or_else(|| anyhow::anyhow!("列 {} 超出预定义范围", y))?;
-        col.push_cell(cell.into_value(), batch_row);
+
+        let data = cell.into_value();
+        let is_null = matches!(data, Data::Empty | Data::Error(_));
+
+        // 推断类型
+        self.infer_dtype(y, &data);
+        let target_dtype: &Option<DataType> = &self.col_dtypes[y];
+
+        // 初始化空列
+        if matches!(self.cols[y], TypedCol::Empty) {
+            let dtype = target_dtype.as_ref().unwrap_or(&DataType::Null);
+            if is_null && *dtype == DataType::Null {
+                // 全是 null 且类型未知，先用 AnyValue 占位
+                self.cols[y] = TypedCol::AnyValue(Vec::with_capacity(self.batch_size));
+            } else {
+                self.cols[y] = TypedCol::new(dtype, self.batch_size);
+            }
+        }
+
+        // 稀疏补齐
+        let current_len = self.cols[y].len();
+        let empty_num = batch_row.saturating_sub(current_len);
+        for _ in 0..empty_num {
+            self.cols[y].push_null();
+        }
+
+        // 类型升级检查
+        if !is_null && !self.cols[y].accepts(&data) {
+            if let Some(dtype) = target_dtype {
+                self.cols[y].upgrade(dtype);
+            } else {
+                self.cols[y].upgrade(&DataType::String);
+            }
+        }
+
+        // 推入值
+        if is_null {
+            self.cols[y].push_null();
+        } else {
+            self.cols[y].push_value(data);
+        }
+
         Ok(())
     }
 
@@ -120,14 +470,7 @@ where
         if matches!(data, Data::Empty | Data::Error(_)) {
             return;
         }
-        let new_dtype = match data {
-            Data::Int(_) => DataType::Int64,
-            Data::Float(_) => DataType::Float64,
-            Data::Bool(_) => DataType::Boolean,
-            Data::String(_) | Data::DateTimeIso(_) | Data::DurationIso(_) => DataType::String,
-            Data::DateTime(_) => DataType::Datetime(TimeUnit::Nanoseconds, None),
-            _ => DataType::Null,
-        };
+        let new_dtype = data_to_dtype(data);
         let current = &mut self.col_dtypes[col_idx];
         *current = match (current.take(), new_dtype) {
             (None, dt) => Some(dt),
@@ -137,33 +480,27 @@ where
             _ => Some(DataType::String),
         };
     }
-}
 
-impl Cols<AnyValue<'static>> {
     pub fn into_dataframe(&mut self) -> PolarsResult<DataFrame> {
-        let max_len = self.vecs.iter().map(|c| c.vec.len()).max().unwrap_or(0);
-        let num_cols = self.vecs.len();
-        let old_vecs = std::mem::replace(
-            &mut self.vecs,
-            (0..num_cols)
-                .map(|i| Col::new(i, self.batch_size))
-                .collect(),
-        );
-        let columns: Vec<Column> = old_vecs
+        let max_len = self.cols.iter().map(|c| c.len()).max().unwrap_or(0);
+        let _num_cols = self.cols.len();
+
+        // 补齐所有列到 max_len
+        for col in &mut self.cols {
+            col.pad_to(max_len);
+        }
+
+        let columns: Vec<Column> = std::mem::take(&mut self.cols)
             .into_iter()
             .enumerate()
-            .map(|(i, mut col)| {
-                if col.vec.len() < max_len {
-                    col.vec.resize(max_len, AnyValue::Null);
-                }
+            .map(|(i, col)| {
                 let name = self.headers.get(i).map(|s| s.as_str()).unwrap_or("unknown");
-                let values = &col.vec[..];
-
-                let series = if let Some(dt) = self.col_dtypes.get(i).and_then(|d| d.as_ref()) {
-                    Series::from_any_values_and_dtype(name.into(), values, dt, false)
+                let dtype = self.col_dtypes.get(i).and_then(|d| d.as_ref());
+                let series = if let Some(dt) = dtype {
+                    col.into_series(name.into(), dt)?
                 } else {
-                    Ok(Series::new(name.into(), values))
-                }?;
+                    col.into_series(name.into(), &DataType::Null)?
+                };
                 Ok::<_, polars::error::PolarsError>(series.into())
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -171,6 +508,7 @@ impl Cols<AnyValue<'static>> {
         DataFrame::new_infer_height(columns)
     }
 }
+
 /// 单线程流式 xlsx DataFrame 迭代器。
 ///
 /// 底层使用独立的 `XlsxStreamReader` 直接解压并解析 sheet XML，
@@ -178,7 +516,7 @@ impl Cols<AnyValue<'static>> {
 pub struct DataFrameIter {
     workbook: Arc<XlsxWorkbook>,
     reader: XlsxStreamReader,
-    cols: Cols<polars::prelude::AnyValue<'static>>,
+    cols: TypedCols,
     cell_cache: Option<Cell<Data>>,
     has_header: bool,
     len: usize,                      // 总批次数
@@ -220,7 +558,7 @@ impl DataFrameIter {
             Some(s) => s,
             None => dim.end.0 as usize + if has_header { 0 } else { 1 },
         };
-        let cols = Cols::new(&dim, batch_size);
+        let cols = TypedCols::new(&dim, batch_size);
         let skip_rows: HashSet<u32> = skip_rows.map(|s| s.iter().copied().collect()).unwrap_or_default();
         let mut iter = Self {
             workbook,
@@ -255,7 +593,7 @@ impl DataFrameIter {
             XlsxStreamReader::from_workbook(Arc::clone(&self.workbook), sheet_name, sheet_idx)?;
         let dim = self.reader.dimensions();
         let batch_size = self.cols.batch_size;
-        self.cols = Cols::new(&dim, batch_size);
+        self.cols = TypedCols::new(&dim, batch_size);
         self.cell_cache = None;
         self.batch_start_row = None;
         self.current_row_count = 0;
@@ -272,7 +610,7 @@ impl DataFrameIter {
             Some(cell) => cell,
             None => {
                 self.cols
-                    .vecs
+                    .cols
                     .iter()
                     .enumerate()
                     .for_each(|(i, _)| self.cols.headers.push(format!("col_{}", i)));
@@ -283,7 +621,7 @@ impl DataFrameIter {
         let first_x = first_cell.get_position().0;
         let mut total_rows: usize;
         if self.has_header {
-            self.cols.headers.push(first_cell.into());
+            self.cols.headers.push(first_cell.into_value().into());
             loop {
                 match self.reader.next_cell()? {
                     Some(cell) => {
@@ -294,7 +632,7 @@ impl DataFrameIter {
                                     .headers
                                     .push(format!("Unknown_{}", self.cols.headers.len()));
                             }
-                            let mut value: String = cell.into();
+                            let mut value: String = cell.into_value().into();
                             value = if value == "" {
                                 format!("Unknown_{}", y)
                             } else {
@@ -320,7 +658,7 @@ impl DataFrameIter {
         } else {
             self.cell_cache = Some(first_cell);
             self.cols
-                .vecs
+                .cols
                 .iter()
                 .enumerate()
                 .for_each(|(i, _)| self.cols.headers.push(format!("col_{}", i)));
@@ -335,7 +673,7 @@ impl DataFrameIter {
     }
 
     fn finish_batch(&mut self) -> Option<anyhow::Result<DataFrame>> {
-        let has_data = self.cols.vecs.iter().any(|c| !c.vec.is_empty());
+        let has_data = self.cols.cols.iter().any(|c| !c.is_empty());
         if !has_data {
             return None;
         }
@@ -406,7 +744,7 @@ impl Iterator for DataFrameIter {
                     }
                 }
                 Ok(None) => {
-                    let has_data = self.cols.vecs.iter().any(|c| !c.vec.is_empty());
+                    let has_data = self.cols.cols.iter().any(|c| !c.is_empty());
                     if has_data {
                         self.len = self.len.saturating_sub(1);
                         return self.finish_batch();
@@ -502,7 +840,6 @@ mod multi_sheet_tests {
         Ok(())
     }
 }
-
 
 #[cfg(test)]
 mod skip_rows_tests {

@@ -6,7 +6,7 @@ use crate::{
 use polars::prelude::*;
 use polars_arrow::array::{Array, MutablePlString, Utf8ViewArray};
 use polars_arrow::bitmap::{Bitmap, MutableBitmap};
-use std::{collections::HashSet, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
 // ------------------------------------------------------------------
 // TypedCol / TypedCols：按类型存储列数据，数值列实现零拷贝构建
@@ -560,7 +560,9 @@ pub struct DataFrameIter {
     last_processed_row: Option<u32>, // 上一个处理的绝对行号（检测行切换)
     current_sheet_name: Option<String>,
     current_sheet_idx: Option<usize>,
-    skip_rows: HashSet<u32>,         // 需要跳过的 0-based 行索引
+    skip_rows_sorted: Vec<u32>,      // 排序后的 skip 行列表（单调递增游标查询）
+    skip_rows_idx: usize,            // skip_rows_sorted 的当前游标
+    current_row_skipped: bool,       // 缓存当前行是否被跳过
 }
 
 impl DataFrameIter {
@@ -595,7 +597,8 @@ impl DataFrameIter {
         };
         let mut cols = TypedCols::new(&dim, batch_size);
         cols.strings = Some(Arc::clone(reader.strings()));
-        let skip_rows: HashSet<u32> = skip_rows.map(|s| s.iter().copied().collect()).unwrap_or_default();
+        let mut skip_rows_sorted: Vec<u32> = skip_rows.map(|s| s.iter().copied().collect()).unwrap_or_default();
+        skip_rows_sorted.sort_unstable();
         let mut iter = Self {
             workbook,
             reader,
@@ -608,7 +611,9 @@ impl DataFrameIter {
             last_processed_row: None,
             current_sheet_name: sheet_name.map(|s| s.to_string()),
             current_sheet_idx: sheet_idx,
-            skip_rows,
+            skip_rows_sorted,
+            skip_rows_idx: 0,
+            current_row_skipped: false,
         };
         iter.find_header(batch_size)?;
 
@@ -638,6 +643,8 @@ impl DataFrameIter {
         self.current_sheet_name = sheet_name.map(|s| s.to_string());
         self.current_sheet_idx = sheet_idx;
         self.len = 0;
+        self.skip_rows_idx = 0;
+        self.current_row_skipped = false;
         self.find_header(batch_size)?;
         Ok(())
     }
@@ -701,12 +708,26 @@ impl DataFrameIter {
                 .for_each(|(i, _)| self.cols.headers.push(format!("col_{}", i)));
             total_rows = (self.reader.dimensions().end.0 - first_x + 1) as usize;
         }
-        let skip_count = self.skip_rows.iter()
+        let skip_count = self.skip_rows_sorted.iter()
             .filter(|&&r| r >= first_x && r <= self.reader.dimensions().end.0)
             .count();
         total_rows = total_rows.saturating_sub(skip_count);
         self.len = (total_rows + batch_size - 1) / batch_size;
         Ok(())
+    }
+
+    /// 用单调递增游标判断某行是否需要跳过（要求 row 按非递减顺序调用）
+    fn is_row_skipped(&mut self, row: u32) -> bool {
+        if self.skip_rows_sorted.is_empty() {
+            return false;
+        }
+        while self.skip_rows_idx < self.skip_rows_sorted.len()
+            && self.skip_rows_sorted[self.skip_rows_idx] < row
+        {
+            self.skip_rows_idx += 1;
+        }
+        self.skip_rows_idx < self.skip_rows_sorted.len()
+            && self.skip_rows_sorted[self.skip_rows_idx] == row
     }
 
     fn finish_batch(&mut self) -> Option<anyhow::Result<DataFrame>> {
@@ -742,7 +763,8 @@ impl Iterator for DataFrameIter {
                     }
                 };
                 let row = cell.get_position().0;
-                if !self.skip_rows.is_empty() && self.skip_rows.contains(&row) {
+                self.current_row_skipped = self.is_row_skipped(row);
+                if self.current_row_skipped {
                     continue;
                 }
                 self.batch_start_row = Some(row);
@@ -760,12 +782,12 @@ impl Iterator for DataFrameIter {
                 Ok(Some(cell)) => {
                     let current_row = cell.get_position().0;
 
-                    // 跳过整行：当前行在 skip_rows 中时，所有 cell 都丢弃
-                    if !self.skip_rows.is_empty() && self.skip_rows.contains(&current_row) {
-                        continue;
-                    }
-
                     if self.last_processed_row.map_or(true, |lr| lr != current_row) {
+                        // 行切换：更新 skip 状态
+                        self.current_row_skipped = self.is_row_skipped(current_row);
+                        if self.current_row_skipped {
+                            continue;
+                        }
                         if self.current_row_count >= self.cols.batch_size {
                             self.cell_cache = Some(cell);
                             self.len = self.len.saturating_sub(1);
@@ -773,6 +795,9 @@ impl Iterator for DataFrameIter {
                         }
                         self.current_row_count += 1;
                         self.last_processed_row = Some(current_row);
+                    } else if self.current_row_skipped {
+                        // 同一行复用 skip 状态
+                        continue;
                     }
 
                     let batch_row = self.current_row_count.saturating_sub(1) as usize;

@@ -356,7 +356,8 @@ impl XlsxStreamReader {
             self.cell_buf.clear();
             match self.xml.read_event_into(&mut self.cell_buf) {
                 Ok(Event::Start(e)) if e.local_name().as_ref() == b"v" => {
-                    // 直接读取 <v> 内容，避免 read_text_content 的 String 分配
+                    // 直接读取 <v> 内容，避免 read_text_content 的函数调用
+                    // 和 xml10_content() 的临时 String 分配
                     self.scratch_buf.clear();
                     match self.xml.read_event_into(&mut self.scratch_buf) {
                         Ok(Event::Text(t)) => {

@@ -176,6 +176,7 @@ impl XlsxStreamReader {
 
         let channel_reader = ChannelReader::new(rx);
         let mut xml = Reader::from_reader(channel_reader);
+        xml.config_mut().trim_text(true);
         let mut dimensions = Dimensions::default();
         let mut in_sheet_data = false;
         let mut pre_buf = Vec::with_capacity(1024);
@@ -355,12 +356,33 @@ impl XlsxStreamReader {
             self.cell_buf.clear();
             match self.xml.read_event_into(&mut self.cell_buf) {
                 Ok(Event::Start(e)) if e.local_name().as_ref() == b"v" => {
-                    let text = crate::utils::read_text_content(
-                        &mut self.xml,
-                        &mut self.scratch_buf,
-                        b"v",
-                    )?;
-                    value = parse_raw_value(&text, t_attr)?;
+                    // 直接读取 <v> 内容，避免 read_text_content 的 String 分配
+                    self.scratch_buf.clear();
+                    match self.xml.read_event_into(&mut self.scratch_buf) {
+                        Ok(Event::Text(t)) => {
+                            let text = std::str::from_utf8(t.as_ref()).unwrap_or_default();
+                            value = parse_raw_value(text, t_attr)?;
+                            // consume </v>
+                            self.scratch_buf.clear();
+                            match self.xml.read_event_into(&mut self.scratch_buf) {
+                                Ok(Event::End(e)) if e.local_name().as_ref() == b"v" => {}
+                                _ => return Err(anyhow!("Expected </v>")),
+                            }
+                        }
+                        Ok(Event::CData(t)) => {
+                            let text = std::str::from_utf8(t.as_ref()).unwrap_or_default();
+                            value = parse_raw_value(text, t_attr)?;
+                            self.scratch_buf.clear();
+                            match self.xml.read_event_into(&mut self.scratch_buf) {
+                                Ok(Event::End(e)) if e.local_name().as_ref() == b"v" => {}
+                                _ => return Err(anyhow!("Expected </v>")),
+                            }
+                        }
+                        Ok(Event::End(e)) if e.local_name().as_ref() == b"v" => {
+                            value = Data::Empty;
+                        }
+                        _ => return Err(anyhow!("Unexpected content in <v>")),
+                    }
                 }
                 Ok(Event::Start(e)) if e.local_name().as_ref() == b"is" => {
                     let text = crate::utils::read_inline_str(

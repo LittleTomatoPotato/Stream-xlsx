@@ -166,12 +166,12 @@ pub fn parse_raw_value(text: &str, t_attr: Option<&str>) -> Result<Data> {
         Some("str") => Ok(Data::String(PlSmallStr::from_str(text))),
         Some("d") => Ok(Data::DateTimeIso(PlSmallStr::from_str(text))),
         _ => {
-            if let Ok(v) = text.parse::<i64>() {
-                Ok(Data::Int(v))
-            } else if let Ok(v) = text.parse::<f64>() {
-                Ok(Data::Float(v))
-            } else {
-                Ok(Data::String(PlSmallStr::from_str(text)))
+            match atoi_simd::parse::<i64, true, true>(text.as_bytes()) {
+                Ok(v) => Ok(Data::Int(v)),
+                Err(_) => match fast_float::parse::<f64, _>(text) {
+                    Ok(v) => Ok(Data::Float(v)),
+                    Err(_) => Ok(Data::String(PlSmallStr::from_str(text))),
+                },
             }
         }
     }

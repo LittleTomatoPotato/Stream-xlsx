@@ -1,4 +1,5 @@
 use crate::excel_types::{CellErrorType, Data, Dimensions};
+use polars::datatypes::PlSmallStr;
 use anyhow::{Result, anyhow};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
@@ -154,7 +155,7 @@ pub fn read_inline_str<R: std::io::BufRead>(
 
 pub fn parse_raw_value(text: &str, t_attr: Option<&str>) -> Result<Data> {
     match t_attr {
-        Some("s") => Ok(Data::String(text.to_string())),
+        Some("s") => Ok(Data::String(PlSmallStr::from_str(text))),
         Some("b") => Ok(Data::Bool(text != "0")),
         Some("e") => {
             let err = text
@@ -162,15 +163,15 @@ pub fn parse_raw_value(text: &str, t_attr: Option<&str>) -> Result<Data> {
                 .unwrap_or(CellErrorType::Value);
             Ok(Data::Error(err))
         }
-        Some("str") => Ok(Data::String(text.to_string())),
-        Some("d") => Ok(Data::DateTimeIso(text.to_string())),
+        Some("str") => Ok(Data::String(PlSmallStr::from_str(text))),
+        Some("d") => Ok(Data::DateTimeIso(PlSmallStr::from_str(text))),
         _ => {
             if let Ok(v) = text.parse::<i64>() {
                 Ok(Data::Int(v))
             } else if let Ok(v) = text.parse::<f64>() {
                 Ok(Data::Float(v))
             } else {
-                Ok(Data::String(text.to_string()))
+                Ok(Data::String(PlSmallStr::from_str(text)))
             }
         }
     }

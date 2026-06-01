@@ -121,7 +121,7 @@ impl TypedCol {
             (Self::Int64(_, _), Data::Int(_)) => true,
             (Self::Float64(_, _), Data::Float(_) | Data::Int(_)) => true,
             (Self::Bool(_, _), Data::Bool(_)) => true,
-            (Self::String(_), Data::String(_) | Data::DateTimeIso(_) | Data::DurationIso(_)) => true,
+            (Self::String(_), Data::String(_) | Data::SharedStringRef(_) | Data::DateTimeIso(_) | Data::DurationIso(_)) => true,
             (Self::DateTime(_, _), Data::DateTime(_)) => true,
             (Self::AnyValue(_), _) => true,
             (_, Data::Empty | Data::Error(_)) => true,
@@ -170,6 +170,15 @@ impl TypedCol {
                 v.push(data.into_anyvalue());
             }
             Self::Empty => {}
+        }
+    }
+
+    /// 推入一个字符串值（绕过 Data 枚举，直接传 &str）
+    pub fn push_str(&mut self, s: &str) {
+        match self {
+            Self::String(arr) => arr.push_value(s),
+            Self::AnyValue(v) => v.push(AnyValue::StringOwned(PlSmallStr::from_str(s))),
+            _ => {}
         }
     }
 
@@ -349,10 +358,11 @@ impl IntoAnyValue for Data {
             Data::Int(v) => AnyValue::Int64(v),
             Data::Float(v) => AnyValue::Float64(v),
             Data::Bool(v) => AnyValue::Boolean(v),
-            Data::String(v) => AnyValue::StringOwned(PlSmallStr::from(v)),
+            Data::String(v) => AnyValue::StringOwned(v),
             Data::DateTime(v) => AnyValue::Datetime(v.to_timestamp_nanos(), TimeUnit::Nanoseconds, None),
-            Data::DateTimeIso(v) => AnyValue::StringOwned(PlSmallStr::from(v)),
-            Data::DurationIso(v) => AnyValue::StringOwned(PlSmallStr::from(v)),
+            Data::DateTimeIso(v) => AnyValue::StringOwned(v),
+            Data::DurationIso(v) => AnyValue::StringOwned(v),
+            Data::SharedStringRef(idx) => AnyValue::StringOwned(PlSmallStr::from_string(idx.to_string())),
             Data::Error(_) | Data::Empty => AnyValue::Null,
         }
     }
@@ -378,13 +388,14 @@ impl FromData for AnyValue<'static> {
 impl FromData for String {
     fn from_data(data: Data) -> Self {
         match data {
-            Data::String(s) => s,
+            Data::String(s) => s.to_string(),
             Data::Int(i) => i.to_string(),
             Data::Float(f) => f.to_string(),
             Data::Bool(b) => b.to_string(),
             Data::DateTime(dt) => dt.to_string(),
-            Data::DateTimeIso(s) | Data::DurationIso(s) => s,
+            Data::DateTimeIso(s) | Data::DurationIso(s) => s.to_string(),
             Data::Error(e) => e.to_string(),
+            Data::SharedStringRef(idx) => idx.to_string(),
             Data::Empty => String::new(),
         }
     }
@@ -397,6 +408,7 @@ pub struct TypedCols {
     pub batch_size: usize,
     pub headers: Vec<String>,
     pub col_dtypes: Vec<Option<DataType>>,
+    pub strings: Option<Arc<Vec<PlSmallStr>>>,
 }
 
 fn data_to_dtype(data: &Data) -> DataType {
@@ -404,7 +416,7 @@ fn data_to_dtype(data: &Data) -> DataType {
         Data::Int(_) => DataType::Int64,
         Data::Float(_) => DataType::Float64,
         Data::Bool(_) => DataType::Boolean,
-        Data::String(_) | Data::DateTimeIso(_) | Data::DurationIso(_) => DataType::String,
+        Data::String(_) | Data::SharedStringRef(_) | Data::DateTimeIso(_) | Data::DurationIso(_) => DataType::String,
         Data::DateTime(_) => DataType::Datetime(TimeUnit::Nanoseconds, None),
         Data::Error(_) | Data::Empty => DataType::Null,
     }
@@ -418,6 +430,7 @@ impl TypedCols {
             batch_size,
             headers: Vec::with_capacity(col_num),
             col_dtypes: vec![None; col_num],
+            strings: None,
         }
     }
 
@@ -471,6 +484,16 @@ impl TypedCols {
         // 推入值
         if is_null {
             self.cols[y].push_null();
+        } else if let Data::SharedStringRef(idx) = &data {
+            if let Some(strings) = &self.strings {
+                if let Some(s) = strings.get(*idx) {
+                    self.cols[y].push_str(s.as_str());
+                } else {
+                    self.cols[y].push_null();
+                }
+            } else {
+                self.cols[y].push_null();
+            }
         } else {
             self.cols[y].push_value(data);
         }
@@ -570,7 +593,8 @@ impl DataFrameIter {
             Some(s) => s,
             None => dim.end.0 as usize + if has_header { 0 } else { 1 },
         };
-        let cols = TypedCols::new(&dim, batch_size);
+        let mut cols = TypedCols::new(&dim, batch_size);
+        cols.strings = Some(Arc::clone(reader.strings()));
         let skip_rows: HashSet<u32> = skip_rows.map(|s| s.iter().copied().collect()).unwrap_or_default();
         let mut iter = Self {
             workbook,
@@ -606,6 +630,7 @@ impl DataFrameIter {
         let dim = self.reader.dimensions();
         let batch_size = self.cols.batch_size;
         self.cols = TypedCols::new(&dim, batch_size);
+        self.cols.strings = Some(Arc::clone(self.reader.strings()));
         self.cell_cache = None;
         self.batch_start_row = None;
         self.current_row_count = 0;

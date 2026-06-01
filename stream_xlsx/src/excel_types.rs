@@ -1,6 +1,8 @@
 use std::fmt;
 use std::str::FromStr;
 
+use polars::datatypes::PlSmallStr;
+
 /// 单元格坐标与值（完全独立，不依赖 calamine）
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cell<T> {
@@ -40,11 +42,12 @@ where
 pub enum Data {
     Int(i64),
     Float(f64),
-    String(String),
+    String(PlSmallStr),
+    SharedStringRef(usize),
     Bool(bool),
     DateTime(ExcelDateTime),
-    DateTimeIso(String),
-    DurationIso(String),
+    DateTimeIso(PlSmallStr),
+    DurationIso(PlSmallStr),
     Error(CellErrorType),
     #[default]
     Empty,
@@ -56,6 +59,7 @@ impl fmt::Display for Data {
             Data::Int(e) => write!(f, "{e}"),
             Data::Float(e) => write!(f, "{e}"),
             Data::String(e) => write!(f, "{e}"),
+            Data::SharedStringRef(e) => write!(f, "shared:{e}"),
             Data::Bool(e) => write!(f, "{e}"),
             Data::DateTime(e) => write!(f, "{e}"),
             Data::DateTimeIso(e) => write!(f, "{e}"),
@@ -69,12 +73,13 @@ impl fmt::Display for Data {
 impl From<Data> for String {
     fn from(data: Data) -> String {
         match data {
-            Data::String(s) => s, // 直接移出，零分配
+            Data::String(s) => s.to_string(),
             Data::Int(i) => i.to_string(),
             Data::Float(f) => f.to_string(),
             Data::Bool(b) => b.to_string(),
             Data::DateTime(dt) => dt.to_string(),
-            Data::DateTimeIso(s) | Data::DurationIso(s) => s, // 同样移出
+            Data::DateTimeIso(s) | Data::DurationIso(s) => s.to_string(),
+            Data::SharedStringRef(idx) => idx.to_string(),
             Data::Error(e) => e.to_string(),
             Data::Empty => String::new(),
         }

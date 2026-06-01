@@ -227,6 +227,10 @@ impl XlsxStreamReader {
         self.dimensions
     }
 
+    pub fn strings(&self) -> &Arc<Vec<PlSmallStr>> {
+        &self.strings
+    }
+
     pub fn next_cell(&mut self) -> Result<Option<Cell<Data>>> {
         if !self.in_sheet_data {
             loop {
@@ -364,7 +368,7 @@ impl XlsxStreamReader {
                         &mut self.cell_buf,
                         &mut self.scratch_buf,
                     )?;
-                    value = Data::String(text);
+                    value = Data::String(PlSmallStr::from_string(text));
                 }
                 Ok(Event::End(e)) if e.local_name().as_ref() == b"c" => break,
                 Ok(Event::Eof) => return Err(anyhow!("Unexpected EOF in <c>")),
@@ -379,7 +383,7 @@ impl XlsxStreamReader {
                     value = self
                         .strings
                         .get(idx)
-                        .map(|s| Data::String(s.to_string()))
+                        .map(|_| Data::SharedStringRef(idx))
                         .unwrap_or(Data::Empty);
                 }
             }

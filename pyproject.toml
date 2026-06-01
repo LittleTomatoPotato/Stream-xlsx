@@ -5,7 +5,13 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "fastexcel>=0.20.2",
     "matplotlib>=3.10.9",
     "polars>=1.41.2",
     "psutil>=7.2.2",
+    "stream-xlsx-py",
+    "xlsx2csv>=0.8.6",
 ]
+
+[tool.uv.sources]
+stream-xlsx-py = { path = "stream_xlsx_py/target/wheels/stream_xlsx_py-0.2.0-cp39-abi3-manylinux_2_34_x86_64.whl" }

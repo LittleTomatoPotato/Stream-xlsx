@@ -79,7 +79,8 @@ impl BufRead for ChannelReader {
 pub struct XlsxStreamReader {
     xml: Reader<ChannelReader>,
     strings: Arc<Vec<PlSmallStr>>, 
-    cell_xfs: Arc<Vec<u32>>,
+    cell_xf_is_date: Arc<Vec<bool>>,
+    #[allow(dead_code)]
     custom_date_numfmts: Arc<HashSet<u32>>,
     date_columns: Vec<Option<bool>>,
     row_index: u32,
@@ -211,7 +212,16 @@ impl XlsxStreamReader {
         Ok(Self {
             xml,
             strings: Arc::clone(workbook.strings().unwrap()),
-            cell_xfs: Arc::clone(workbook.cell_xfs().unwrap()),
+            cell_xf_is_date: {
+                let cell_xfs = workbook.cell_xfs().unwrap();
+                let custom = workbook.custom_date_numfmts().unwrap();
+                Arc::new(
+                    cell_xfs
+                        .iter()
+                        .map(|&id| crate::utils::is_date_numfmt(id, custom))
+                        .collect(),
+                )
+            },
             custom_date_numfmts: Arc::clone(workbook.custom_date_numfmts().unwrap()),
             date_columns: Vec::new(),
             row_index: 0,
@@ -327,9 +337,10 @@ impl XlsxStreamReader {
                     let is_date = match self.date_columns[col_idx] {
                         Some(cached) => cached,
                         None => {
+                            // 直接索引预计算表,O(1) 无 HashSet
                             let result = s_attr_usize
-                                .and_then(|idx| self.cell_xfs.get(idx))
-                                .map(|&id| self.is_date_numfmt(id))
+                                .and_then(|idx| self.cell_xf_is_date.get(idx))
+                                .copied()
                                 .unwrap_or(false);
                             // 只在有 s 属性的单元格上缓存，避免无 s 属性的单元格（如 header）把列锁死
                             if s_attr_usize.is_some() {
@@ -345,8 +356,10 @@ impl XlsxStreamReader {
         }
     }
 
-    fn is_date_numfmt(&self, num_fmt_id: u32) -> bool {
-        crate::utils::is_date_numfmt(num_fmt_id, &self.custom_date_numfmts)
+    #[allow(dead_code)]
+    fn is_date_numfmt(&self, _num_fmt_id: u32) -> bool {
+        // 实际路径通过 cell_xf_is_date 预计算表直接索引,本方法保留供外部 trait 使用
+        false
     }
 
     fn read_cell_value(&mut self, t_attr: Option<&str>, is_date: bool) -> Result<Data> {
@@ -356,33 +369,39 @@ impl XlsxStreamReader {
             self.cell_buf.clear();
             match self.xml.read_event_into(&mut self.cell_buf) {
                 Ok(Event::Start(e)) if e.local_name().as_ref() == b"v" => {
-                    // 直接读取 <v> 内容，避免 read_text_content 的函数调用
-                    // 和 xml10_content() 的临时 String 分配
-                    self.scratch_buf.clear();
-                    match self.xml.read_event_into(&mut self.scratch_buf) {
-                        Ok(Event::Text(t)) => {
-                            let text = std::str::from_utf8(t.as_ref()).unwrap_or_default();
-                            value = parse_raw_value(text, t_attr)?;
-                            // consume </v>
-                            self.scratch_buf.clear();
-                            match self.xml.read_event_into(&mut self.scratch_buf) {
-                                Ok(Event::End(e)) if e.local_name().as_ref() == b"v" => {}
-                                _ => return Err(anyhow!("Expected </v>")),
+                    if matches!(t_attr, Some("s")) {
+                        // Fast path: avoid the intermediate Data::String(idx_text) alloc.
+                        // Read <v>idx</v>, parse idx, look up shared string directly.
+                        value = self.read_shared_string_value()?;
+                    } else {
+                        // 直接读取 <v> 内容，避免 read_text_content 的函数调用
+                        // 和 xml10_content() 的临时 String 分配
+                        self.scratch_buf.clear();
+                        match self.xml.read_event_into(&mut self.scratch_buf) {
+                            Ok(Event::Text(t)) => {
+                                let text = std::str::from_utf8(t.as_ref()).unwrap_or_default();
+                                value = parse_raw_value(text, t_attr)?;
+                                // consume </v>
+                                self.scratch_buf.clear();
+                                match self.xml.read_event_into(&mut self.scratch_buf) {
+                                    Ok(Event::End(e)) if e.local_name().as_ref() == b"v" => {}
+                                    _ => return Err(anyhow!("Expected </v>")),
+                                }
                             }
-                        }
-                        Ok(Event::CData(t)) => {
-                            let text = std::str::from_utf8(t.as_ref()).unwrap_or_default();
-                            value = parse_raw_value(text, t_attr)?;
-                            self.scratch_buf.clear();
-                            match self.xml.read_event_into(&mut self.scratch_buf) {
-                                Ok(Event::End(e)) if e.local_name().as_ref() == b"v" => {}
-                                _ => return Err(anyhow!("Expected </v>")),
+                            Ok(Event::CData(t)) => {
+                                let text = std::str::from_utf8(t.as_ref()).unwrap_or_default();
+                                value = parse_raw_value(text, t_attr)?;
+                                self.scratch_buf.clear();
+                                match self.xml.read_event_into(&mut self.scratch_buf) {
+                                    Ok(Event::End(e)) if e.local_name().as_ref() == b"v" => {}
+                                    _ => return Err(anyhow!("Expected </v>")),
+                                }
                             }
+                            Ok(Event::End(e)) if e.local_name().as_ref() == b"v" => {
+                                value = Data::Empty;
+                            }
+                            _ => return Err(anyhow!("Unexpected content in <v>")),
                         }
-                        Ok(Event::End(e)) if e.local_name().as_ref() == b"v" => {
-                            value = Data::Empty;
-                        }
-                        _ => return Err(anyhow!("Unexpected content in <v>")),
                     }
                 }
                 Ok(Event::Start(e)) if e.local_name().as_ref() == b"is" => {
@@ -400,18 +419,6 @@ impl XlsxStreamReader {
             }
         }
 
-        if let Some("s") = t_attr.as_deref() {
-            if let Data::String(s) = &value {
-                if let Ok(idx) = s.parse::<usize>() {
-                    value = self
-                        .strings
-                        .get(idx)
-                        .map(|_| Data::SharedStringRef(idx))
-                        .unwrap_or(Data::Empty);
-                }
-            }
-        }
-
         // 日期转换：已缓存为日期列的数字单元格直接转 DateTime
         if is_date && (t_attr.is_none() || t_attr.as_deref() == Some("")) {
             value = match value {
@@ -424,6 +431,38 @@ impl XlsxStreamReader {
         }
 
         Ok(value)
+    }
+
+    /// 直接从 `<v>idx</v>` 解析 shared string 索引,返回 `Data::SharedStringRef`。
+    fn read_shared_string_value(&mut self) -> Result<Data> {
+        loop {
+            self.scratch_buf.clear();
+            match self.xml.read_event_into(&mut self.scratch_buf) {
+                Ok(Event::Text(t)) => {
+                    // xml10_content 对 ASCII 返回 Cow::Borrowed,零拷贝
+                    let cow = t.xml10_content()?;
+                    if let Ok(idx) = cow.parse::<usize>() {
+                        if idx < self.strings.len() {
+                            return Ok(Data::SharedStringRef(idx));
+                        }
+                    }
+                }
+                Ok(Event::CData(t)) => {
+                    if let Ok(idx) = std::str::from_utf8(t.as_ref())
+                        .unwrap_or("")
+                        .parse::<usize>()
+                    {
+                        if idx < self.strings.len() {
+                            return Ok(Data::SharedStringRef(idx));
+                        }
+                    }
+                }
+                Ok(Event::End(e)) if e.local_name().as_ref() == b"v" => return Ok(Data::Empty),
+                Ok(Event::Eof) => return Err(anyhow!("Unexpected EOF in <v>")),
+                Err(e) => return Err(anyhow!("XML error in <v>: {}", e)),
+                _ => {}
+            }
+        }
     }
 }
 

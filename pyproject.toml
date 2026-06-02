@@ -14,4 +14,4 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-stream-xlsx-py = { path = "stream_xlsx_py/target/wheels/stream_xlsx_py-0.2.0-cp39-abi3-manylinux_2_34_x86_64.whl" }
+stream-xlsx-py = { path = "stream_xlsx_py/target/wheels/stream_xlsx_py-0.2.0-cp39-abi3-macosx_11_0_arm64.whl" }

@@ -7,8 +7,10 @@ edition = "2024"
 anyhow = "1.0.102"
 polars = "0.53.0"
 polars-arrow = "0.53.0"
+polars-buffer = "0.53.0"
 quick-xml = "0.39"
-zip = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+flate2 = { version = "1", features = ["zlib-rs"] }
 bytes = "1.11.1"
 atoi_simd = "0.18.1"
 fast-float = "0.2.0"

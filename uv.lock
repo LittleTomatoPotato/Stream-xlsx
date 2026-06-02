@@ -333,19 +333,19 @@ requires-dist = [
     { name = "matplotlib", specifier = ">=3.10.9" },
     { name = "polars", specifier = ">=1.41.2" },
     { name = "psutil", specifier = ">=7.2.2" },
-    { name = "stream-xlsx-py", path = "stream_xlsx_py/target/wheels/stream_xlsx_py-0.2.0-cp39-abi3-manylinux_2_34_x86_64.whl" },
+    { name = "stream-xlsx-py", path = "stream_xlsx_py/target/wheels/stream_xlsx_py-0.2.0-cp39-abi3-macosx_11_0_arm64.whl" },
     { name = "xlsx2csv", specifier = ">=0.8.6" },
 ]
 
 [[package]]
 name = "stream-xlsx-py"
 version = "0.2.0"
-source = { path = "stream_xlsx_py/target/wheels/stream_xlsx_py-0.2.0-cp39-abi3-manylinux_2_34_x86_64.whl" }
+source = { path = "stream_xlsx_py/target/wheels/stream_xlsx_py-0.2.0-cp39-abi3-macosx_11_0_arm64.whl" }
 dependencies = [
     { name = "polars" },
 ]
 wheels = [
-    { filename = "stream_xlsx_py-0.2.0-cp39-abi3-manylinux_2_34_x86_64.whl", hash = "sha256:dbee11e477d002fd13e421eb6cbfb7cfae945f43325ebf1ec88395116daa0f2c" },
+    { filename = "stream_xlsx_py-0.2.0-cp39-abi3-macosx_11_0_arm64.whl", hash = "sha256:3e6d6d77f1b784c45ba8e583adff90ea1d6ea14e1778a045012830cd51bb4adc" },
 ]
 
 [package.metadata]

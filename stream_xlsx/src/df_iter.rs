@@ -1,10 +1,10 @@
 use crate::{
     excel_types::{Cell, Data, Dimensions},
-    workbook::XlsxWorkbook,
+    workbook::{SharedStrings, XlsxWorkbook},
     xlsx_stream_lm::XlsxStreamReader,
 };
 use polars::prelude::*;
-use polars_arrow::array::{Array, MutablePlString, Utf8ViewArray};
+use polars_arrow::array::{Array, MutablePlString, Utf8ViewArray, View};
 use polars_arrow::bitmap::{Bitmap, MutableBitmap};
 use std::{path::Path, sync::Arc};
 
@@ -178,6 +178,35 @@ impl TypedCol {
         match self {
             Self::String(arr) => arr.push_value(s),
             Self::AnyValue(v) => v.push(AnyValue::StringOwned(PlSmallStr::from_str(s))),
+            _ => {}
+        }
+    }
+
+    /// 推入一个 shared string 引用，利用 Arrow StringView 直接引用外部 buffer，零拷贝。
+    pub fn push_shared_string_ref(&mut self, idx: usize, strings: &SharedStrings) {
+        match self {
+            Self::String(arr) => {
+                if let Some((offset, len)) = strings.offsets.get(idx) {
+                    let offset_usize = *offset as usize;
+                    let len_usize = *len as usize;
+                    let slice = &strings.buffer[offset_usize..offset_usize + len_usize];
+                    let view = View::new_from_bytes(slice, 0, *offset);
+                    arr.push_view(view, std::slice::from_ref(&strings.buffer));
+                } else {
+                    arr.push_null();
+                }
+            }
+            Self::AnyValue(v) => {
+                if let Some((offset, len)) = strings.offsets.get(idx) {
+                    let offset_usize = *offset as usize;
+                    let len_usize = *len as usize;
+                    let s = std::str::from_utf8(&strings.buffer[offset_usize..offset_usize + len_usize])
+                        .unwrap_or_default();
+                    v.push(AnyValue::StringOwned(PlSmallStr::from_str(s)));
+                } else {
+                    v.push(AnyValue::Null);
+                }
+            }
             _ => {}
         }
     }
@@ -408,7 +437,7 @@ pub struct TypedCols {
     pub batch_size: usize,
     pub headers: Vec<String>,
     pub col_dtypes: Vec<Option<DataType>>,
-    pub strings: Option<Arc<Vec<PlSmallStr>>>,
+    pub strings: Option<Arc<SharedStrings>>,
 }
 
 fn data_to_dtype(data: &Data) -> DataType {
@@ -486,11 +515,7 @@ impl TypedCols {
             self.cols[y].push_null();
         } else if let Data::SharedStringRef(idx) = &data {
             if let Some(strings) = &self.strings {
-                if let Some(s) = strings.get(*idx) {
-                    self.cols[y].push_str(s.as_str());
-                } else {
-                    self.cols[y].push_null();
-                }
+                self.cols[y].push_shared_string_ref(*idx, strings);
             } else {
                 self.cols[y].push_null();
             }
@@ -541,6 +566,25 @@ impl TypedCols {
             .collect::<Result<Vec<_>, _>>()?;
 
         DataFrame::new_infer_height(columns)
+    }
+}
+
+/// 将单元格 Data 解析为 header 字符串，shared string 会查表解析为实际内容。
+fn cell_value_to_header(data: Data, strings: Option<&Arc<SharedStrings>>) -> String {
+    match data {
+        Data::SharedStringRef(idx) => {
+            if let Some(s) = strings {
+                if let Some((offset, len)) = s.offsets.get(idx) {
+                    let start = *offset as usize;
+                    let end = start + *len as usize;
+                    return std::str::from_utf8(&s.buffer[start..end])
+                        .unwrap_or_default()
+                        .to_string();
+                }
+            }
+            String::new()
+        }
+        other => other.into(),
     }
 }
 
@@ -650,6 +694,7 @@ impl DataFrameIter {
     }
 
     fn find_header(&mut self, batch_size: usize) -> anyhow::Result<()> {
+        let strings = self.cols.strings.clone();
         let first_cell = match self.reader.next_cell()? {
             Some(cell) => cell,
             None => {
@@ -665,7 +710,7 @@ impl DataFrameIter {
         let first_x = first_cell.get_position().0;
         let mut total_rows: usize;
         if self.has_header {
-            self.cols.headers.push(first_cell.into_value().into());
+            self.cols.headers.push(cell_value_to_header(first_cell.into_value(), strings.as_ref()));
             loop {
                 match self.reader.next_cell()? {
                     Some(cell) => {
@@ -676,13 +721,13 @@ impl DataFrameIter {
                                     .headers
                                     .push(format!("Unknown_{}", self.cols.headers.len()));
                             }
-                            let mut value: String = cell.into_value().into();
-                            value = if value == "" {
+                            let mut value = cell_value_to_header(cell.into_value(), strings.as_ref());
+                            value = if value.is_empty() {
                                 format!("Unknown_{}", y)
                             } else {
                                 value
                             };
-                            self.cols.headers.push(value.into());
+                            self.cols.headers.push(value);
                         } else {
                             self.cell_cache = Some(cell);
                             let header_num = self.cols.headers.len() as u32;
@@ -1035,5 +1080,60 @@ mod skip_header_interaction_tests {
         println!("Scenario 4 first row: {:?}", df.get_row(0));
         assert!(df.height() > 0);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod zero_copy_tests {
+    use super::*;
+    use polars_buffer::Buffer;
+
+    #[test]
+    fn test_push_shared_string_ref_zero_copy() {
+        let strings = SharedStrings {
+            buffer: Buffer::from_vec(b"hello world foo bar".to_vec()),
+            offsets: vec![(0, 5), (6, 5), (12, 3), (16, 3)],
+        };
+        let mut col = TypedCol::String(MutablePlString::with_capacity(4));
+        
+        col.push_shared_string_ref(0, &strings); // "hello" (5 bytes) -> inline
+        col.push_shared_string_ref(1, &strings); // "world" (5 bytes) -> inline
+        col.push_shared_string_ref(2, &strings); // "foo" (3 bytes) -> inline
+        col.push_shared_string_ref(3, &strings); // "bar" (3 bytes) -> inline
+        
+        // 所有字符串 <=12 bytes，应该全部被 inline，不引用外部 buffer
+        if let TypedCol::String(arr) = &col {
+            assert_eq!(arr.len(), 4);
+            // 因为没有非 inline 字符串，completed_buffers 应该为空
+            assert!(arr.completed_buffers().is_empty());
+            // in_progress_buffer 也应该为空（inline 不写入 buffer）
+            assert_eq!(arr.total_buffer_len(), 0);
+        } else {
+            panic!("expected String col");
+        }
+    }
+
+    #[test]
+    fn test_push_shared_string_ref_long_zero_copy() {
+        let long_str = "a".repeat(100);
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(long_str.as_bytes());
+        let strings = SharedStrings {
+            buffer: Buffer::from_vec(buffer),
+            offsets: vec![(0, 100)],
+        };
+        let mut col = TypedCol::String(MutablePlString::with_capacity(1));
+        
+        col.push_shared_string_ref(0, &strings); // 100 bytes -> non-inline, 引用外部 buffer
+        
+        if let TypedCol::String(arr) = &col {
+            assert_eq!(arr.len(), 1);
+            // 应该引用外部 buffer，completed_buffers 里应该有 1 个 buffer
+            assert_eq!(arr.completed_buffers().len(), 1);
+            // total_buffer_len 应该等于 100
+            assert_eq!(arr.total_buffer_len(), 100);
+        } else {
+            panic!("expected String col");
+        }
     }
 }

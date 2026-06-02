@@ -164,7 +164,7 @@ def main():
     plt.close(fig)
 
     print(f"\nPlots saved to {out_dir}/")
-    print(f"Data saved to benchmark_python.json / benchmark_python.csv")
+    print("Data saved to benchmark_python.json / benchmark_python.csv")
 
     # Summary table
     print("\n" + "=" * 80)

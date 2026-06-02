@@ -1,7 +1,7 @@
 /// 默认采用256KB作为内存切片的默认值, 后续可以考虑添加一个新的后台线程读取前N的块,记录最大值 暂时不做过度优化自动处理切片大小节省内存
 use crate::excel_types::{Cell, Data, Dimensions};
 use crate::utils::*;
-use crate::workbook::XlsxWorkbook;
+use crate::workbook::{SharedStrings, XlsxWorkbook};
 use anyhow::{Result, anyhow};
 use bytes::{Bytes, BytesMut};
 use polars::datatypes::PlSmallStr;
@@ -78,7 +78,8 @@ impl BufRead for ChannelReader {
 /// 3. 主线程用 quick-xml 从 channel 上逐事件解析 `<row>` / `<c>`。
 pub struct XlsxStreamReader {
     xml: Reader<ChannelReader>,
-    strings: Arc<Vec<PlSmallStr>>, 
+    strings: Arc<SharedStrings>,
+    strings_count: usize,
     cell_xf_is_date: Arc<Vec<bool>>,
     #[allow(dead_code)]
     custom_date_numfmts: Arc<HashSet<u32>>,
@@ -212,6 +213,7 @@ impl XlsxStreamReader {
         Ok(Self {
             xml,
             strings: Arc::clone(workbook.strings().unwrap()),
+            strings_count: workbook.strings().unwrap().offsets.len(),
             cell_xf_is_date: {
                 let cell_xfs = workbook.cell_xfs().unwrap();
                 let custom = workbook.custom_date_numfmts().unwrap();
@@ -223,7 +225,7 @@ impl XlsxStreamReader {
                 )
             },
             custom_date_numfmts: Arc::clone(workbook.custom_date_numfmts().unwrap()),
-            date_columns: Vec::new(),
+            date_columns: vec![None; dimensions.end.1 as usize + 1],
             row_index: 0,
             col_index: 0,
             buf: Vec::with_capacity(1024),
@@ -238,30 +240,11 @@ impl XlsxStreamReader {
         self.dimensions
     }
 
-    pub fn strings(&self) -> &Arc<Vec<PlSmallStr>> {
+    pub fn strings(&self) -> &Arc<SharedStrings> {
         &self.strings
     }
 
     pub fn next_cell(&mut self) -> Result<Option<Cell<Data>>> {
-        if !self.in_sheet_data {
-            loop {
-                self.buf.clear();
-                match self.xml.read_event_into(&mut self.buf) {
-                    Ok(Event::Start(e)) if e.local_name().as_ref() == b"sheetData" => {
-                        self.in_sheet_data = true;
-                        break;
-                    }
-                    Ok(Event::Empty(e)) if e.local_name().as_ref() == b"sheetData" => {
-                        self.in_sheet_data = true;
-                        return Ok(None);
-                    }
-                    Ok(Event::Eof) => return Ok(None),
-                    Err(e) => return Err(anyhow!("XML error: {}", e)),
-                    _ => {}
-                }
-            }
-        }
-
         loop {
             self.buf.clear();
             let event = self.xml.read_event_into(&mut self.buf);
@@ -281,7 +264,9 @@ impl XlsxStreamReader {
                     let mut pos = None;
                     let mut t_attr: Option<&str> = None;
                     let mut s_attr: Option<usize> = None;
-                    for attr in e.attributes() {
+                    let mut attrs = e.attributes();
+                    attrs.with_checks(false);
+                    for attr in attrs {
                         let attr = attr?;
                         match attr.key.as_ref() {
                             b"r" => {
@@ -320,7 +305,7 @@ impl XlsxStreamReader {
                     self.in_sheet_data = false;
                     return Ok(None);
                 }
-                Ok(Event::Eof) => return Err(anyhow!("Unexpected EOF in sheetData")),
+                Ok(Event::Eof) => return Ok(None),
                 Err(e) => return Err(anyhow!("XML error: {}", e)),
                 _ => None,
             };
@@ -439,10 +424,11 @@ impl XlsxStreamReader {
             self.scratch_buf.clear();
             match self.xml.read_event_into(&mut self.scratch_buf) {
                 Ok(Event::Text(t)) => {
-                    // xml10_content 对 ASCII 返回 Cow::Borrowed,零拷贝
-                    let cow = t.xml10_content()?;
-                    if let Ok(idx) = cow.parse::<usize>() {
-                        if idx < self.strings.len() {
+                    // shared string index 是纯 ASCII 数字，直接转 &str 即可，
+                    // 避免 xml10_content() 内部的 normalize_xml10_eols() memchr 扫描
+                    let text = std::str::from_utf8(t.as_ref()).unwrap_or("");
+                    if let Ok(idx) = text.parse::<usize>() {
+                        if idx < self.strings_count {
                             return Ok(Data::SharedStringRef(idx));
                         }
                     }
@@ -452,7 +438,7 @@ impl XlsxStreamReader {
                         .unwrap_or("")
                         .parse::<usize>()
                     {
-                        if idx < self.strings.len() {
+                        if idx < self.strings_count {
                             return Ok(Data::SharedStringRef(idx));
                         }
                     }

@@ -1,6 +1,6 @@
 use crate::utils::*;
 use anyhow::{Context, Result, anyhow};
-use polars::datatypes::PlSmallStr;
+use polars_buffer::Buffer;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use std::collections::{HashMap, HashSet};
@@ -9,11 +9,18 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use zip::ZipArchive;
 
+/// 连续 buffer + offsets 形式的共享字符串表，可被 Arrow StringView 零拷贝引用。
+#[derive(Debug)]
+pub struct SharedStrings {
+    pub buffer: Buffer<u8>,
+    pub offsets: Vec<(u32, u32)>, // (offset, length)
+}
+
 /// 工作簿级共享数据，解析 sheet 列表立即完成，strings/styles 惰性加载。
 #[derive(Debug)]
 pub struct XlsxWorkbook {
     path: PathBuf,
-    strings: OnceLock<Arc<Vec<PlSmallStr>>>, 
+    strings: OnceLock<Arc<SharedStrings>>,
     cell_xfs: OnceLock<Arc<Vec<u32>>>,
     custom_date_numfmts: OnceLock<Arc<HashSet<u32>>>,
     sheets: OrderdSheets,
@@ -60,7 +67,7 @@ impl XlsxWorkbook {
         &self.path
     }
 
-    pub fn strings(&self) -> Option<&Arc<Vec<PlSmallStr>>> {
+    pub fn strings(&self) -> Option<&Arc<SharedStrings>> {
         self.strings.get()
     }
 
@@ -178,12 +185,16 @@ impl XlsxWorkbook {
         Ok(sheets)
     }
 
-    fn read_shared_strings<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<Vec<PlSmallStr>> {
+    fn read_shared_strings<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<SharedStrings> {
         let file = match archive.by_name("xl/sharedStrings.xml") {
             Ok(f) => f,
-            Err(_) => return Ok(Vec::new()),
+            Err(_) => return Ok(SharedStrings {
+                buffer: Buffer::from_vec(Vec::new()),
+                offsets: Vec::new(),
+            }),
         };
-        let mut strings = Vec::new();
+        let mut buffer = Vec::with_capacity(64 * 1024);
+        let mut offsets = Vec::new();
         let mut reader = Reader::from_reader(BufReader::with_capacity(256 * 1024, file));
         let mut buf = Vec::new();
         let mut in_si = false;
@@ -198,7 +209,11 @@ impl XlsxWorkbook {
                 }
                 Ok(Event::End(e)) if e.local_name().as_ref() == b"si" => {
                     in_si = false;
-                    strings.push(PlSmallStr::from_string(std::mem::take(&mut current_text)));
+                    let start = buffer.len() as u32;
+                    let bytes = current_text.as_bytes();
+                    buffer.extend_from_slice(bytes);
+                    offsets.push((start, bytes.len() as u32));
+                    current_text.clear();
                 }
                 Ok(Event::Start(e)) if e.local_name().as_ref() == b"t" && in_si => {
                     let mut text_buf = Vec::new();
@@ -226,7 +241,10 @@ impl XlsxWorkbook {
                 _ => {}
             }
         }
-        Ok(strings)
+        Ok(SharedStrings {
+            buffer: Buffer::from_vec(buffer),
+            offsets,
+        })
     }
 
     fn read_styles<R: Read + Seek>(

@@ -172,8 +172,8 @@ def main():
             results.append(result)
             status = "✅" if result["returncode"] == 0 else "❌"
             print(
-                f"    {status} batch={bs:>7}  time={result['elapsed_sec']:>6.2f}s  "
-                f"peak_mem={result['peak_rss_mb']:>8.1f}MB  stdout={result["stdout"]}"
+                f"    {status} batch={bs:>7}  time={result['elapsed_sec']:>6.2f}s  ",
+                f"peak_mem={result['peak_rss_mb']:>8.1f}MB  stdout={result['stdout']}",
             )
             if result["stderr"]:
                 print(f"       stderr: {result['stderr']}")

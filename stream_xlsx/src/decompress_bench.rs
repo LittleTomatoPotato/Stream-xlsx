@@ -106,7 +106,7 @@ mod tests {
         (total_uncompressed as f64 / 1024.0 / 1024.0) / elapsed
     }
 
-    /// 测量 `XlsxWorkbook::open` + `init` 中各阶段耗时。
+    /// 测量 `XlsxWorkbook::open` + `init` 中各阶段耗时（两种模式对比）。
     #[test]
     fn profile_workbook_init() {
         let path = Path::new(TEST_FILE);
@@ -117,23 +117,37 @@ mod tests {
 
         let sep: String = iter::repeat('=').take(60).collect();
         eprintln!("\n{}", sep);
-        eprintln!("profile_workbook_init (1 iteration, includes XML parsing)");
+        eprintln!("profile_workbook_init — 两种模式对比");
         eprintln!("{}", sep);
 
-        // Phase 1: open (reads rels + workbook.xml only)
-        let t0 = Instant::now();
-        let wb = crate::workbook::XlsxWorkbook::open(path).unwrap();
-        let open_elapsed = t0.elapsed().as_secs_f64();
-        eprintln!("Phase 1  open()          : {:.3}s (rels + workbook.xml)", open_elapsed);
+        // 低内存模式 (default)
+        {
+            let t0 = Instant::now();
+            let wb = crate::workbook::XlsxWorkbook::open(path).unwrap();
+            let open_elapsed = t0.elapsed().as_secs_f64();
+            let t1 = Instant::now();
+            wb.init().unwrap();
+            let init_elapsed = t1.elapsed().as_secs_f64();
+            eprintln!(
+                "低内存模式 : open {:.3}s + init {:.3}s = {:.3}s",
+                open_elapsed, init_elapsed, open_elapsed + init_elapsed
+            );
+        }
 
-        // Phase 2: init (reads sharedStrings.xml + styles.xml)
-        let t1 = Instant::now();
-        wb.init().unwrap();
-        let init_elapsed = t1.elapsed().as_secs_f64();
-        eprintln!("Phase 2  init()          : {:.3}s (sharedStrings + styles)", init_elapsed);
+        // 激进模式 (fast)
+        {
+            let t0 = Instant::now();
+            let wb = crate::workbook::XlsxWorkbook::open_fast(path).unwrap();
+            let open_elapsed = t0.elapsed().as_secs_f64();
+            let t1 = Instant::now();
+            wb.init().unwrap();
+            let init_elapsed = t1.elapsed().as_secs_f64();
+            eprintln!(
+                "激进模式   : open {:.3}s + init {:.3}s = {:.3}s",
+                open_elapsed, init_elapsed, open_elapsed + init_elapsed
+            );
+        }
 
-        eprintln!("{}", sep);
-        eprintln!("Total workbook setup     : {:.3}s", open_elapsed + init_elapsed);
         eprintln!("{}", sep);
     }
 
@@ -238,7 +252,7 @@ mod tests {
         }
     }
 
-    /// 对比 quick-xml vs 字节扫描的正确性和性能。
+    /// 对比低内存模式 vs 激进模式的正确性和性能。
     #[test]
     fn compare_shared_strings_parsers() {
         let path = Path::new(TEST_FILE);
@@ -249,55 +263,50 @@ mod tests {
 
         let sep: String = iter::repeat('=').take(60).collect();
         eprintln!("\n{}", sep);
-        eprintln!("对比 quick-xml vs 字节扫描");
+        eprintln!("对比 低内存模式 vs 激进模式");
         eprintln!("{}", sep);
 
-        // 1. quick-xml 解析
+        // 1. 低内存模式 (default)
         let t0 = Instant::now();
-        let wb = crate::workbook::XlsxWorkbook::open(path).unwrap();
-        wb.init().unwrap();
-        let quick_xml_time = t0.elapsed().as_secs_f64();
-        let strings = wb.strings().unwrap();
-        let quick_count = strings.offsets.len();
-        eprintln!("quick-xml : {} 个字符串, 耗时 {:.3}s", quick_count, quick_xml_time);
+        let wb_low = crate::workbook::XlsxWorkbook::open(path).unwrap();
+        wb_low.init().unwrap();
+        let low_time = t0.elapsed().as_secs_f64();
+        let low_strings = wb_low.strings().unwrap();
+        let low_count = low_strings.offsets.len();
+        eprintln!("低内存模式: {} 个字符串, 耗时 {:.3}s", low_count, low_time);
 
-        // 2. 字节扫描解析
-        let file = std::fs::File::open(path).unwrap();
-        let reader = BufReader::new(file);
-        let mut archive = zip::ZipArchive::new(reader).unwrap();
-        let mut file = archive.by_name("xl/sharedStrings.xml").unwrap();
-        let mut xml = Vec::with_capacity(file.size() as usize);
-        file.read_to_end(&mut xml).unwrap();
-
+        // 2. 激进模式 (fast)
         let t1 = Instant::now();
-        let (scan_buffer, scan_offsets) = parse_shared_strings_fast(&xml);
-        let scan_time = t1.elapsed().as_secs_f64();
-        let scan_count = scan_offsets.len();
-        eprintln!("字节扫描  : {} 个字符串, 耗时 {:.3}s", scan_count, scan_time);
+        let wb_fast = crate::workbook::XlsxWorkbook::open_fast(path).unwrap();
+        wb_fast.init().unwrap();
+        let fast_time = t1.elapsed().as_secs_f64();
+        let fast_strings = wb_fast.strings().unwrap();
+        let fast_count = fast_strings.offsets.len();
+        eprintln!("激进模式  : {} 个字符串, 耗时 {:.3}s", fast_count, fast_time);
 
         eprintln!("{}", sep);
 
         // 3. 验证一致性
-        if quick_count != scan_count {
-            eprintln!("❌ 字符串数量不一致: quick-xml={}, 扫描={}", quick_count, scan_count);
+        if low_count != fast_count {
+            eprintln!("❌ 字符串数量不一致: 低内存={}, 激进={}", low_count, fast_count);
             return;
         }
 
         let mut mismatches = 0;
-        let max_check = quick_count.min(10000); // 抽样验证前 10000 个
+        let max_check = low_count.min(10000);
         for i in 0..max_check {
-            let (q_start, q_len) = strings.offsets[i];
-            let (s_start, s_len) = scan_offsets[i];
-            let q_text = &strings.buffer.as_slice()[q_start as usize..(q_start + q_len) as usize];
-            let s_text = &scan_buffer[s_start as usize..(s_start + s_len) as usize];
-            if q_text != s_text {
+            let (l_start, l_len) = low_strings.offsets[i];
+            let (f_start, f_len) = fast_strings.offsets[i];
+            let l_text = &low_strings.buffer.as_slice()[l_start as usize..(l_start + l_len) as usize];
+            let f_text = &fast_strings.buffer.as_slice()[f_start as usize..(f_start + f_len) as usize];
+            if l_text != f_text {
                 mismatches += 1;
                 if mismatches <= 3 {
                     eprintln!(
-                        "❌ 第 {} 个字符串不匹配:\n  quick-xml: {:?}\n  扫描    : {:?}",
+                        "❌ 第 {} 个字符串不匹配:\n  低内存: {:?}\n  激进  : {:?}",
                         i,
-                        String::from_utf8_lossy(q_text),
-                        String::from_utf8_lossy(s_text)
+                        String::from_utf8_lossy(l_text),
+                        String::from_utf8_lossy(f_text)
                     );
                 }
             }
@@ -309,64 +318,13 @@ mod tests {
             eprintln!("❌ {} / {} 个字符串内容不匹配", mismatches, max_check);
         }
 
-        if scan_count > 0 {
+        if fast_count > 0 {
             eprintln!(
                 "📈 加速比: {:.1}x",
-                quick_xml_time / scan_time
+                low_time / fast_time
             );
         }
         eprintln!("{}", sep);
-    }
-
-    /// 快速字节扫描解析 sharedStrings.xml。
-    fn parse_shared_strings_fast(xml: &[u8]) -> (Vec<u8>, Vec<(u32, u32)>) {
-        let mut buffer = Vec::with_capacity(xml.len() / 4);
-        let mut offsets = Vec::with_capacity(xml.len() / 32);
-
-        let mut i = 0;
-        while i < xml.len() {
-            // 找 <si>
-            let si_pos = match find_subsequence(&xml[i..], b"<si>") {
-                Some(p) => p,
-                None => break,
-            };
-            i += si_pos + 4;
-
-            // 找 <t> 或 <t ...>
-            let t_pos = match find_subsequence(&xml[i..], b"<t") {
-                Some(p) => p,
-                None => { i += 1; continue; }
-            };
-            i += t_pos;
-
-            // 跳过 <t> 或 <t ...> 到 >
-            while i < xml.len() && xml[i] != b'>' {
-                i += 1;
-            }
-            i += 1; // skip >
-
-            // 找 </t>
-            let t_end = match find_subsequence(&xml[i..], b"</t>") {
-                Some(p) => p,
-                None => break,
-            };
-
-            let text = &xml[i..i + t_end];
-            let start = buffer.len() as u32;
-            buffer.extend_from_slice(text);
-            offsets.push((start, t_end as u32));
-
-            i += t_end + 4;
-
-            // 跳过到 </si>
-            let si_end = match find_subsequence(&xml[i..], b"</si>") {
-                Some(p) => p,
-                None => break,
-            };
-            i += si_end + 5;
-        }
-
-        (buffer, offsets)
     }
 
     fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {

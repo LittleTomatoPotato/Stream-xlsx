@@ -24,10 +24,25 @@ pub struct XlsxWorkbook {
     cell_xfs: OnceLock<Arc<Vec<u32>>>,
     custom_date_numfmts: OnceLock<Arc<HashSet<u32>>>,
     sheets: OrderdSheets,
+    /// If true, decompress sharedStrings.xml fully into memory and parse with
+    /// a byte scanner (~5× faster, ~+2-4GB peak memory).
+    fast_shared_strings: bool,
 }
 
 impl XlsxWorkbook {
+    /// Open workbook in low-memory mode (default).
+    /// sharedStrings.xml is parsed streaming via quick-xml.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::open_with_mode(path, false)
+    }
+
+    /// Open workbook in fast mode.
+    /// sharedStrings.xml is fully decompressed then byte-scanned.
+    pub fn open_fast<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::open_with_mode(path, true)
+    }
+
+    fn open_with_mode<P: AsRef<Path>>(path: P, fast_shared_strings: bool) -> Result<Self> {
         let path = path.as_ref().to_owned();
         let file = std::fs::File::open(&path)?;
         let reader = BufReader::new(file);
@@ -42,6 +57,7 @@ impl XlsxWorkbook {
             cell_xfs: OnceLock::new(),
             custom_date_numfmts: OnceLock::new(),
             sheets,
+            fast_shared_strings,
         })
     }
 
@@ -54,7 +70,7 @@ impl XlsxWorkbook {
         let reader = BufReader::new(file);
         let mut archive = ZipArchive::new(reader)?;
 
-        let strings = Arc::new(Self::read_shared_strings(&mut archive)?);
+        let strings = Arc::new(Self::read_shared_strings(&mut archive, self.fast_shared_strings)?);
         let (cell_xfs, custom_date_numfmts) = Self::read_styles(&mut archive)?;
 
         let _ = self.strings.set(strings);
@@ -185,7 +201,10 @@ impl XlsxWorkbook {
         Ok(sheets)
     }
 
-    fn read_shared_strings<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<SharedStrings> {
+    fn read_shared_strings<R: Read + Seek>(
+        archive: &mut ZipArchive<R>,
+        fast: bool,
+    ) -> Result<SharedStrings> {
         let file = match archive.by_name("xl/sharedStrings.xml") {
             Ok(f) => f,
             Err(_) => return Ok(SharedStrings {
@@ -193,9 +212,156 @@ impl XlsxWorkbook {
                 offsets: Vec::new(),
             }),
         };
+
+        if fast {
+            // Aggressive mode: fully decompress then byte-scan.
+            // Peak memory += ~2-4GB (uncompressed XML + buffers).
+            let mut xml = Vec::with_capacity(file.size() as usize);
+            BufReader::with_capacity(256 * 1024, file).read_to_end(&mut xml)?;
+
+            if let Ok(result) = Self::parse_shared_strings_fast(&xml) {
+                return Ok(result);
+            }
+            Self::parse_shared_strings_xml(&xml)
+        } else {
+            // Low-memory mode: stream via quick-xml (default).
+            let mut buffer = Vec::with_capacity(64 * 1024);
+            let mut offsets = Vec::new();
+            let mut reader = Reader::from_reader(BufReader::with_capacity(256 * 1024, file));
+            let mut buf = Vec::new();
+            let mut in_si = false;
+            let mut current_text = String::new();
+
+            loop {
+                buf.clear();
+                match reader.read_event_into(&mut buf) {
+                    Ok(Event::Start(e)) if e.local_name().as_ref() == b"si" => {
+                        in_si = true;
+                        current_text.clear();
+                    }
+                    Ok(Event::End(e)) if e.local_name().as_ref() == b"si" => {
+                        in_si = false;
+                        let start = buffer.len() as u32;
+                        let bytes = current_text.as_bytes();
+                        buffer.extend_from_slice(bytes);
+                        offsets.push((start, bytes.len() as u32));
+                        current_text.clear();
+                    }
+                    Ok(Event::Start(e)) if e.local_name().as_ref() == b"t" && in_si => {
+                        let mut text_buf = Vec::new();
+                        loop {
+                            text_buf.clear();
+                            match reader.read_event_into(&mut text_buf) {
+                                Ok(Event::Text(t)) => {
+                                    current_text.push_str(&t.xml10_content().unwrap_or_default());
+                                }
+                                Ok(Event::CData(t)) => {
+                                    current_text.push_str(&String::from_utf8_lossy(t.as_ref()));
+                                }
+                                Ok(Event::End(e)) if e.local_name().as_ref() == b"t" => break,
+                                Ok(Event::Eof) => {
+                                    return Err(anyhow!("Unexpected EOF in shared string"));
+                                }
+                                Err(e) => return Err(anyhow!("XML error in shared string: {}", e)),
+                                _ => {}
+                            }
+                        }
+                    }
+                    Ok(Event::End(e)) if e.local_name().as_ref() == b"sst" => break,
+                    Ok(Event::Eof) => break,
+                    Err(e) => return Err(anyhow!("XML error in shared strings: {}", e)),
+                    _ => {}
+                }
+            }
+            Ok(SharedStrings {
+                buffer: Buffer::from_vec(buffer),
+                offsets,
+            })
+        }
+    }
+
+    /// Fast path: scan raw bytes for `<si><t>...</t></si>` patterns.
+    /// Falls back to XML parser on rich text (`<r>`), CDATA, or XML entities.
+    fn parse_shared_strings_fast(xml: &[u8]) -> Result<SharedStrings> {
+        let mut buffer = Vec::with_capacity(xml.len() / 4);
+        let mut offsets = Vec::with_capacity(xml.len() / 32);
+
+        let mut i = 0;
+        while i < xml.len() {
+            // Find <si>
+            let si_pos = match find_subsequence(&xml[i..], b"<si>") {
+                Some(p) => p,
+                None => break,
+            };
+            i += si_pos + 4;
+
+            // Find </si> to determine the boundary of this <si>
+            let si_end = match find_subsequence(&xml[i..], b"</si>") {
+                Some(p) => p,
+                None => return Err(anyhow!("No </si> found")),
+            };
+            let si_content = &xml[i..i + si_end];
+
+            // Check for rich text (<r>) or CDATA — not supported in fast path
+            if si_content.windows(3).any(|w| w == b"<r>") {
+                return Err(anyhow!("Rich text <r> not supported in fast path"));
+            }
+            if si_content.windows(9).any(|w| w == b"<![CDATA[") {
+                return Err(anyhow!("CDATA not supported in fast path"));
+            }
+
+            // Find <t> or <t ...> within this <si>
+            let t_pos = match find_subsequence(si_content, b"<t") {
+                Some(p) => p,
+                None => {
+                    // Empty string: <si></si> or <si><t/></si>
+                    offsets.push((buffer.len() as u32, 0));
+                    i += si_end + 5;
+                    continue;
+                }
+            };
+
+            let mut t_start = t_pos + 2;
+            // Skip attributes until '>'
+            while t_start < si_content.len() && si_content[t_start] != b'>' {
+                if si_content[t_start] == b'&' {
+                    return Err(anyhow!("XML entity in <t> attribute not supported"));
+                }
+                t_start += 1;
+            }
+            t_start += 1; // skip '>'
+
+            // Find </t>
+            let t_end = match find_subsequence(&si_content[t_start..], b"</t>") {
+                Some(p) => p,
+                None => return Err(anyhow!("No </t> found")),
+            };
+
+            let text = &si_content[t_start..t_start + t_end];
+
+            // XML entity check in text content
+            if text.contains(&b'&') {
+                return Err(anyhow!("XML entity in text not supported in fast path"));
+            }
+
+            let start = buffer.len() as u32;
+            buffer.extend_from_slice(text);
+            offsets.push((start, t_end as u32));
+
+            i += si_end + 5;
+        }
+
+        Ok(SharedStrings {
+            buffer: Buffer::from_vec(buffer),
+            offsets,
+        })
+    }
+
+    /// Fallback: full quick-xml parser for complex sharedStrings.
+    fn parse_shared_strings_xml(xml: &[u8]) -> Result<SharedStrings> {
         let mut buffer = Vec::with_capacity(64 * 1024);
         let mut offsets = Vec::new();
-        let mut reader = Reader::from_reader(BufReader::with_capacity(256 * 1024, file));
+        let mut reader = Reader::from_reader(BufReader::with_capacity(256 * 1024, xml));
         let mut buf = Vec::new();
         let mut in_si = false;
         let mut current_text = String::new();
@@ -305,4 +471,10 @@ impl XlsxWorkbook {
         }
         Ok((cell_xfs, custom_date_numfmts))
     }
+}
+
+/// Find the first occurrence of `needle` in `haystack` using byte-window comparison.
+#[inline]
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|window| window == needle)
 }

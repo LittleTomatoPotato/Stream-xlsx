@@ -34,6 +34,10 @@ pub struct Args {
         hide = true
     )]
     pub reader: Option<String>,
+    /// Fast mode: fully decompress sharedStrings.xml then byte-scan.
+    /// Trades ~2-4GB extra peak memory for ~1.5x faster init().
+    #[arg(long, global = true)]
+    pub fast: bool,
 }
 
 #[derive(Debug, Subcommand)]

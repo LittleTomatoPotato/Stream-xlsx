@@ -91,11 +91,21 @@ pub fn test_parttern(
         _ => {}
     }
 
-    let df_iter = match df_iter(args.batch_size, path, None, 0.into(), true, None) {
-        Ok(a) => a,
-        Err(e) => {
-            println!("文件打开错误: {}, 输入路径:{:?}", e, path);
-            return;
+    let df_iter = if args.fast {
+        match stream_xlsx::df_iter::df_iter_fast(args.batch_size, path, None, 0.into(), true, None) {
+            Ok(a) => a,
+            Err(e) => {
+                println!("文件打开错误: {}, 输入路径:{:?}", e, path);
+                return;
+            }
+        }
+    } else {
+        match df_iter(args.batch_size, path, None, 0.into(), true, None) {
+            Ok(a) => a,
+            Err(e) => {
+                println!("文件打开错误: {}, 输入路径:{:?}", e, path);
+                return;
+            }
         }
     };
     match parttern {

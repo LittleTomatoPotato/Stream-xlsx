@@ -18,7 +18,16 @@ fn get_iter(
     sheet_name: &Option<String>,
     sheet_idx: &usize,
 ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<polars::prelude::DataFrame>>>> {
-    let iter: Box<dyn Iterator<Item = anyhow::Result<polars::prelude::DataFrame>>> =
+    let iter: Box<dyn Iterator<Item = anyhow::Result<polars::prelude::DataFrame>>> = if args.fast {
+        Box::new(stream_xlsx::df_iter::df_iter_fast(
+            args.batch_size,
+            path,
+            sheet_name.as_deref(),
+            Some(*sheet_idx),
+            true,
+            None,
+        )?)
+    } else {
         Box::new(df_iter(
             args.batch_size,
             path,
@@ -26,7 +35,8 @@ fn get_iter(
             Some(*sheet_idx),
             true,
             None,
-        )?);
+        )?)
+    };
     Ok(iter)
 }
 

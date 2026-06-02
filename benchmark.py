@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark both readers across batch sizes, measuring time-series RSS."""
+"""Benchmark both modes (low-memory vs fast) across batch sizes, measuring time-series RSS."""
 
 import csv
 import json
@@ -15,15 +15,15 @@ import psutil
 matplotlib.use("Agg")
 
 
-def run_benchmark(reader: str, batch_size: int, file: Path) -> dict:
+def run_benchmark(mode: str, batch_size: int, file: Path) -> dict:
     cmd = [
         "./target/release/sxlsx",
         "-B",
         str(batch_size),
-        "test",
-        "count",
-        str(file),
     ]
+    if mode == "fast":
+        cmd.append("--fast")
+    cmd.extend(["test", "count", str(file)])
     print(f"  → {' '.join(cmd)}")
 
     start = time.perf_counter()
@@ -60,7 +60,7 @@ def run_benchmark(reader: str, batch_size: int, file: Path) -> dict:
     )
 
     return {
-        "reader": reader,
+        "mode": mode,
         "batch_size": batch_size,
         "elapsed_sec": round(elapsed, 2),
         "peak_rss_mb": round(peak_rss_mb, 1),
@@ -74,50 +74,48 @@ def run_benchmark(reader: str, batch_size: int, file: Path) -> dict:
 
 def plot_all(results: list, out_dir: Path):
     out_dir.mkdir(exist_ok=True)
-    readers = ["lm"]
-    colors = plt.cm.tab10
+    modes = ["default", "fast"]
+    colors = {"default": "#1f77b4", "fast": "#ff7f0e"}
 
-    # 1. Per-reader combined figure (all batch sizes on one plot)
-    for r_idx, reader in enumerate(readers):
+    # 1. Per-mode combined figure (all batch sizes on one plot)
+    for mode in modes:
         fig, ax = plt.subplots(figsize=(10, 5))
-        reader_results = [res for res in results if res["reader"] == reader]
-        for i, res in enumerate(reader_results):
+        mode_results = [res for res in results if res["mode"] == mode]
+        for i, res in enumerate(mode_results):
             ax.plot(
                 res["timestamps"],
                 res["rss_series"],
                 label=f"batch={res['batch_size']}",
-                color=colors(i),
+                color=plt.cm.tab10(i),
                 linewidth=1.2,
             )
-        ax.set_title(f"Memory Usage Over Time — Reader: {reader}")
+        ax.set_title(f"Memory Usage Over Time — Mode: {mode}")
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("RSS (MB)")
         ax.legend(loc="upper right")
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
-        fig.savefig(out_dir / f"memory_{reader}.png", dpi=150)
+        fig.savefig(out_dir / f"memory_{mode}.png", dpi=150)
         plt.close(fig)
 
-    # 2. Per-batch-size comparison figure (default vs lm)
+    # 2. Per-batch-size comparison figure (default vs fast)
     batch_sizes = sorted({res["batch_size"] for res in results})
     for bs in batch_sizes:
         fig, ax = plt.subplots(figsize=(10, 5))
-        for r_idx, reader in enumerate(readers):
+        for mode in modes:
             res = next(
-                (r for r in results if r["reader"] == reader and r["batch_size"] == bs),
+                (r for r in results if r["mode"] == mode and r["batch_size"] == bs),
                 None,
             )
-            if not res:
-                continue
             if res:
                 ax.plot(
                     res["timestamps"],
                     res["rss_series"],
-                    label=f"{reader}",
-                    color=colors(r_idx),
+                    label=f"{mode}",
+                    color=colors[mode],
                     linewidth=1.5,
                 )
-        ax.set_title(f"Memory Usage Over Time — Reader: lm, Batch Size: {bs}")
+        ax.set_title(f"Memory Usage Over Time — Batch Size: {bs}")
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("RSS (MB)")
         ax.legend(loc="upper right")
@@ -126,23 +124,72 @@ def plot_all(results: list, out_dir: Path):
         fig.savefig(out_dir / f"memory_batch_{bs}.png", dpi=150)
         plt.close(fig)
 
-    # 3. 2x6 grid: every condition gets its own mini-plot
-    fig, axes = plt.subplots(1, 6, figsize=(24, 4), sharey=True)
-    for r_idx, reader in enumerate(readers):
+    # 3. Bar chart: time & memory comparison per batch size
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Time bar chart
+    ax = axes[0]
+    x = range(len(batch_sizes))
+    width = 0.35
+    default_times = [
+        next((r["elapsed_sec"] for r in results if r["mode"] == "default" and r["batch_size"] == bs), 0)
+        for bs in batch_sizes
+    ]
+    fast_times = [
+        next((r["elapsed_sec"] for r in results if r["mode"] == "fast" and r["batch_size"] == bs), 0)
+        for bs in batch_sizes
+    ]
+    ax.bar([i - width / 2 for i in x], default_times, width, label="default", color=colors["default"])
+    ax.bar([i + width / 2 for i in x], fast_times, width, label="fast", color=colors["fast"])
+    ax.set_xlabel("Batch Size")
+    ax.set_ylabel("Time (s)")
+    ax.set_title("Elapsed Time Comparison")
+    ax.set_xticks(x)
+    ax.set_xticklabels(batch_sizes, rotation=45, ha="right")
+    ax.legend()
+    ax.grid(True, alpha=0.3, axis="y")
+
+    # Memory bar chart
+    ax = axes[1]
+    default_mem = [
+        next((r["peak_rss_mb"] for r in results if r["mode"] == "default" and r["batch_size"] == bs), 0)
+        for bs in batch_sizes
+    ]
+    fast_mem = [
+        next((r["peak_rss_mb"] for r in results if r["mode"] == "fast" and r["batch_size"] == bs), 0)
+        for bs in batch_sizes
+    ]
+    ax.bar([i - width / 2 for i in x], default_mem, width, label="default", color=colors["default"])
+    ax.bar([i + width / 2 for i in x], fast_mem, width, label="fast", color=colors["fast"])
+    ax.set_xlabel("Batch Size")
+    ax.set_ylabel("Peak RSS (MB)")
+    ax.set_title("Peak Memory Comparison")
+    ax.set_xticks(x)
+    ax.set_xticklabels(batch_sizes, rotation=45, ha="right")
+    ax.legend()
+    ax.grid(True, alpha=0.3, axis="y")
+
+    fig.tight_layout()
+    fig.savefig(out_dir / "comparison_bars.png", dpi=150)
+    plt.close(fig)
+
+    # 4. 2xN grid: every condition gets its own mini-plot
+    fig, axes = plt.subplots(2, len(batch_sizes), figsize=(4 * len(batch_sizes), 8), sharey=True)
+    for m_idx, mode in enumerate(modes):
         for b_idx, bs in enumerate(batch_sizes):
-            ax = axes[b_idx]
+            ax = axes[m_idx][b_idx]
             res = next(
-                (r for r in results if r["reader"] == reader and r["batch_size"] == bs),
+                (r for r in results if r["mode"] == mode and r["batch_size"] == bs),
                 None,
             )
             if res:
                 ax.plot(
                     res["timestamps"],
                     res["rss_series"],
-                    color=colors(r_idx),
+                    color=colors[mode],
                     linewidth=1,
                 )
-                ax.set_title(f"{reader}\nbatch={bs}", fontsize=10)
+                ax.set_title(f"{mode}\nbatch={bs}", fontsize=10)
                 ax.set_xlabel("Time (s)", fontsize=8)
                 if b_idx == 0:
                     ax.set_ylabel("RSS (MB)", fontsize=8)
@@ -159,16 +206,16 @@ def main():
         print(f"File not found: {file}")
         sys.exit(1)
 
-    readers = ["lm"]
+    modes = ["default", "fast"]
     batch_sizes = [1_000, 5_000, 10_000, 50_000, 100_000, 1_000_000]
     results = []
 
-    for reader in readers:
+    for mode in modes:
         print(f"\n{'=' * 60}")
-        print(f"Reader: {reader}")
+        print(f"Mode: {mode}")
         print(f"{'=' * 60}")
         for bs in batch_sizes:
-            result = run_benchmark(reader, bs, file)
+            result = run_benchmark(mode, bs, file)
             results.append(result)
             status = "✅" if result["returncode"] == 0 else "❌"
             print(
@@ -190,7 +237,7 @@ def main():
         writer = csv.DictWriter(
             f,
             fieldnames=[
-                "reader",
+                "mode",
                 "batch_size",
                 "elapsed_sec",
                 "peak_rss_mb",
@@ -209,14 +256,27 @@ def main():
     print(f"Plots saved to {out_dir}/")
 
     # Print summary table
-    print("\n" + "=" * 70)
-    print(f"{'Reader':<10} {'Batch':>8} {'Time(s)':>10} {'Peak(MB)':>12}")
-    print("-" * 70)
-    for r in results:
-        print(
-            f"{r['reader']:<10} {r['batch_size']:>8} {r['elapsed_sec']:>10.2f} {r['peak_rss_mb']:>12.1f}"
+    print("\n" + "=" * 80)
+    print(f"{'Mode':<10} {'Batch':>8} {'Time(s)':>10} {'Peak(MB)':>12} {'Speedup':>10}")
+    print("-" * 80)
+    for bs in batch_sizes:
+        default_time = next(
+            (r["elapsed_sec"] for r in results if r["mode"] == "default" and r["batch_size"] == bs), 0
         )
-    print("=" * 70)
+        fast_time = next(
+            (r["elapsed_sec"] for r in results if r["mode"] == "fast" and r["batch_size"] == bs), 0
+        )
+        default_mem = next(
+            (r["peak_rss_mb"] for r in results if r["mode"] == "default" and r["batch_size"] == bs), 0
+        )
+        fast_mem = next(
+            (r["peak_rss_mb"] for r in results if r["mode"] == "fast" and r["batch_size"] == bs), 0
+        )
+        speedup = f"{default_time / fast_time:.2f}x" if fast_time > 0 else "N/A"
+        print(f"{'default':<10} {bs:>8} {default_time:>10.2f} {default_mem:>12.1f}")
+        print(f"{'fast':<10} {bs:>8} {fast_time:>10.2f} {fast_mem:>12.1f} {speedup:>10}")
+        print("-" * 80)
+    print("=" * 80)
 
 
 if __name__ == "__main__":

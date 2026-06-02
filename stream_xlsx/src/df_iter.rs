@@ -617,11 +617,16 @@ impl DataFrameIter {
         sheet_idx: Option<usize>,
         has_header: bool,
         skip_rows: Option<&[u32]>,
+        fast: bool,
     ) -> anyhow::Result<Self>
     where
         P: AsRef<Path>,
     {
-        let workbook = Arc::new(XlsxWorkbook::open(path)?);
+        let workbook = if fast {
+            Arc::new(XlsxWorkbook::open_fast(path)?)
+        } else {
+            Arc::new(XlsxWorkbook::open(path)?)
+        };
         Self::from_workbook(batch_size, workbook, sheet_name, sheet_idx, has_header, skip_rows)
     }
 
@@ -871,6 +876,7 @@ impl Iterator for DataFrameIter {
 impl ExactSizeIterator for DataFrameIter {}
 
 /// 便捷函数：直接返回一个 DataFrame 迭代器
+/// Low-memory mode (default): stream sharedStrings.xml via quick-xml.
 pub fn df_iter(
     batch_size: Option<usize>,
     path: impl AsRef<Path>,
@@ -879,7 +885,20 @@ pub fn df_iter(
     has_header: bool,
     skip_rows: Option<&[u32]>,
 ) -> anyhow::Result<DataFrameIter> {
-    DataFrameIter::new(batch_size, path, sheet_name, sheet_idx, has_header, skip_rows)
+    DataFrameIter::new(batch_size, path, sheet_name, sheet_idx, has_header, skip_rows, false)
+}
+
+/// Fast mode: fully decompress sharedStrings.xml then byte-scan.
+/// Trades ~2-4GB extra peak memory for ~1.5x faster init().
+pub fn df_iter_fast(
+    batch_size: Option<usize>,
+    path: impl AsRef<Path>,
+    sheet_name: Option<&str>,
+    sheet_idx: Option<usize>,
+    has_header: bool,
+    skip_rows: Option<&[u32]>,
+) -> anyhow::Result<DataFrameIter> {
+    DataFrameIter::new(batch_size, path, sheet_name, sheet_idx, has_header, skip_rows, true)
 }
 
 #[cfg(test)]

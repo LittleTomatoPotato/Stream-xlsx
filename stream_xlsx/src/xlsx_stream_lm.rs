@@ -505,3 +505,37 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod bench_tests {
+    use super::*;
+    use std::time::Instant;
+
+    const TEST_FILE: &str = "../test_100w_60c.xlsx";
+
+    /// 测量 XlsxStreamReader 读取 sheet 的总耗时，分解解压和解析瓶颈。
+    #[test]
+    fn profile_sheet_stream() {
+        let path = std::path::Path::new(TEST_FILE);
+        if !path.exists() {
+            eprintln!("跳过：{} 不存在", path.display());
+            return;
+        }
+
+        let sep: String = std::iter::repeat('=').take(60).collect();
+        eprintln!("\n{}", sep);
+        eprintln!("sheet 流式读取性能分解");
+        eprintln!("{}", sep);
+
+        let t0 = Instant::now();
+        let mut reader = XlsxStreamReader::new(path, None, Some(0)).unwrap();
+        let mut count = 0usize;
+        while let Ok(Some(_cell)) = reader.next_cell() {
+            count += 1;
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        eprintln!("A. 完整 next_cell (含解压+解析): {:.3}s  [cells={}]", dt, count);
+
+        eprintln!("{}", sep);
+    }
+}

@@ -2947,6 +2947,7 @@ dependencies = [
  "anyhow",
  "atoi_simd 0.18.1",
  "bytes",
+ "crossbeam-channel",
  "fast-float",
  "flate2",
  "polars",

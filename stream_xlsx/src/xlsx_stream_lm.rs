@@ -539,3 +539,103 @@ mod bench_tests {
         eprintln!("{}", sep);
     }
 }
+
+#[cfg(test)]
+mod bench_tests2 {
+    use super::*;
+    use std::time::Instant;
+    use quick_xml::events::Event;
+
+    const TEST_FILE: &str = "../test_100w_60c.xlsx";
+
+    /// 对比 next_cell 各子步骤的耗时。
+    #[test]
+    fn profile_next_cell_breakdown() {
+        let path = std::path::Path::new(TEST_FILE);
+        if !path.exists() { return; }
+
+        let sep: String = std::iter::repeat('=').take(60).collect();
+        eprintln!("\n{}", sep);
+        eprintln!("next_cell 子步骤耗时分解");
+        eprintln!("{}", sep);
+
+        // A. 纯 next_cell（完整流程）
+        {
+            let t0 = Instant::now();
+            let mut reader = XlsxStreamReader::new(path, None, Some(0)).unwrap();
+            let mut count = 0usize;
+            while let Ok(Some(_cell)) = reader.next_cell() {
+                count += 1;
+            }
+            eprintln!("A. 完整 next_cell                : {:.3}s  [cells={}]", t0.elapsed().as_secs_f64(), count);
+        }
+
+        // B. 只解压，不做任何解析
+        {
+            let file = std::fs::File::open(path).unwrap();
+            let reader = BufReader::new(file);
+            let mut archive = zip::ZipArchive::new(reader).unwrap();
+            let mut f = archive.by_name("xl/worksheets/sheet1.xml").unwrap();
+            let mut buf = vec![0u8; 8 * 1024 * 1024];
+            let mut total = 0usize;
+            let t0 = Instant::now();
+            loop {
+                let n = f.read(&mut buf).unwrap();
+                if n == 0 { break; }
+                total += n;
+            }
+            eprintln!("B. 纯解压（不解析）               : {:.3}s  [bytes={}]", t0.elapsed().as_secs_f64(), total);
+        }
+
+        // C. 用 quick-xml 只读事件，不做任何数据转换
+        {
+            let file = std::fs::File::open(path).unwrap();
+            let reader = BufReader::new(file);
+            let mut archive = zip::ZipArchive::new(reader).unwrap();
+            let f = archive.by_name("xl/worksheets/sheet1.xml").unwrap();
+            let mut xml = Reader::from_reader(BufReader::new(f));
+            let mut buf = Vec::new();
+            let mut events = 0usize;
+            let t0 = Instant::now();
+            loop {
+                buf.clear();
+                match xml.read_event_into(&mut buf) {
+                    Ok(Event::Start(_)) | Ok(Event::End(_)) | Ok(Event::Empty(_)) | Ok(Event::Text(_)) => events += 1,
+                    Ok(Event::Eof) => break,
+                    Err(_) => break,
+                    _ => {}
+                }
+            }
+            eprintln!("C. quick-xml 纯事件（无转换）     : {:.3}s  [events={}]", t0.elapsed().as_secs_f64(), events);
+        }
+
+        // D. 用 quick-xml 解析到 <c> 级别，但不构建 Cell
+        {
+            let file = std::fs::File::open(path).unwrap();
+            let reader = BufReader::new(file);
+            let mut archive = zip::ZipArchive::new(reader).unwrap();
+            let f = archive.by_name("xl/worksheets/sheet1.xml").unwrap();
+            let mut xml = Reader::from_reader(BufReader::new(f));
+            let mut buf = Vec::new();
+            let mut cells = 0usize;
+            let t0 = Instant::now();
+            loop {
+                buf.clear();
+                match xml.read_event_into(&mut buf) {
+                    Ok(Event::Empty(e)) | Ok(Event::Start(e))
+                        if e.local_name().as_ref() == b"c" =>
+                    {
+                        cells += 1;
+                    }
+                    Ok(Event::End(e)) if e.local_name().as_ref() == b"sheetData" => break,
+                    Ok(Event::Eof) => break,
+                    Err(_) => break,
+                    _ => {}
+                }
+            }
+            eprintln!("D. quick-xml 到 <c> 标签（无Cell）: {:.3}s  [cells={}]", t0.elapsed().as_secs_f64(), cells);
+        }
+
+        eprintln!("{}", sep);
+    }
+}

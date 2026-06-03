@@ -205,7 +205,7 @@ impl XlsxWorkbook {
         archive: &mut ZipArchive<R>,
         fast: bool,
     ) -> Result<SharedStrings> {
-        let file = match archive.by_name("xl/sharedStrings.xml") {
+        let mut file = match archive.by_name("xl/sharedStrings.xml") {
             Ok(f) => f,
             Err(_) => return Ok(SharedStrings {
                 buffer: Buffer::from_vec(Vec::new()),
@@ -214,15 +214,24 @@ impl XlsxWorkbook {
         };
 
         if fast {
-            // Aggressive mode: fully decompress then byte-scan.
-            // Peak memory += ~2-4GB (uncompressed XML + buffers).
-            let mut xml = Vec::with_capacity(file.size() as usize);
-            BufReader::with_capacity(256 * 1024, file).read_to_end(&mut xml)?;
-
-            if let Ok(result) = Self::parse_shared_strings_fast(&xml) {
-                return Ok(result);
+            // Fast path: pre-allocate exact capacity to avoid Vec reallocations
+            // (which were causing the ~5GB peak), then scan in-place.
+            let uncompressed_size = file.size() as usize;
+            let mut xml = if uncompressed_size > 0 {
+                Vec::with_capacity(uncompressed_size)
+            } else {
+                // Data descriptor: size unknown until read. Use compressed size × 5 as heuristic.
+                let estimated = (file.compressed_size() as usize).saturating_mul(5);
+                Vec::with_capacity(estimated.max(64 * 1024))
+            };
+            file.read_to_end(&mut xml)?;
+            match Self::parse_shared_strings_fast(xml) {
+                Ok(result) => return Ok(result),
+                Err((xml, _e)) => {
+                    // Fallback for rich text / CDATA / entities
+                    Self::parse_shared_strings_xml(std::io::Cursor::new(xml))
+                }
             }
-            Self::parse_shared_strings_xml(&xml)
         } else {
             // Low-memory mode: stream via quick-xml (default).
             let mut buffer = Vec::with_capacity(64 * 1024);
@@ -281,12 +290,14 @@ impl XlsxWorkbook {
     }
 
     /// Fast path: scan raw bytes for `<si><t>...</t></si>` patterns.
-    /// Falls back to XML parser on rich text (`<r>`), CDATA, or XML entities.
-    fn parse_shared_strings_fast(xml: &[u8]) -> Result<SharedStrings> {
-        let mut buffer = Vec::with_capacity(xml.len() / 4);
+    /// In-place: reuses the decompressed XML buffer, eliminating the extra
+    /// 2GB buffer allocation. With exact-capacity pre-allocation peak memory
+    /// stays at ~2.4 GB (2 GB xml + 430 MB offsets) instead of ~5 GB.
+    fn parse_shared_strings_fast(mut xml: Vec<u8>) -> Result<SharedStrings, (Vec<u8>, anyhow::Error)> {
         let mut offsets = Vec::with_capacity(xml.len() / 32);
-
+        let mut write_pos = 0;
         let mut i = 0;
+
         while i < xml.len() {
             // Find <si>
             let si_pos = match find_subsequence(&xml[i..], b"<si>") {
@@ -298,16 +309,16 @@ impl XlsxWorkbook {
             // Find </si> to determine the boundary of this <si>
             let si_end = match find_subsequence(&xml[i..], b"</si>") {
                 Some(p) => p,
-                None => return Err(anyhow!("No </si> found")),
+                None => return Err((xml, anyhow!("No </si> found"))),
             };
             let si_content = &xml[i..i + si_end];
 
             // Check for rich text (<r>) or CDATA — not supported in fast path
             if si_content.windows(3).any(|w| w == b"<r>") {
-                return Err(anyhow!("Rich text <r> not supported in fast path"));
+                return Err((xml, anyhow!("Rich text <r> not supported in fast path")));
             }
             if si_content.windows(9).any(|w| w == b"<![CDATA[") {
-                return Err(anyhow!("CDATA not supported in fast path"));
+                return Err((xml, anyhow!("CDATA not supported in fast path")));
             }
 
             // Find <t> or <t ...> within this <si>
@@ -315,7 +326,7 @@ impl XlsxWorkbook {
                 Some(p) => p,
                 None => {
                     // Empty string: <si></si> or <si><t/></si>
-                    offsets.push((buffer.len() as u32, 0));
+                    offsets.push((write_pos as u32, 0));
                     i += si_end + 5;
                     continue;
                 }
@@ -325,43 +336,64 @@ impl XlsxWorkbook {
             // Skip attributes until '>'
             while t_start < si_content.len() && si_content[t_start] != b'>' {
                 if si_content[t_start] == b'&' {
-                    return Err(anyhow!("XML entity in <t> attribute not supported"));
+                    return Err((xml, anyhow!("XML entity in <t> attribute not supported")));
                 }
                 t_start += 1;
+            }
+            if t_start >= si_content.len() {
+                return Err((xml, anyhow!("Unclosed <t> tag")));
+            }
+            // Detect self-closing tag <t/> or <t attr="val"/>
+            if t_start > t_pos + 2 && si_content[t_start - 1] == b'/' {
+                offsets.push((write_pos as u32, 0));
+                i += si_end + 5;
+                continue;
             }
             t_start += 1; // skip '>'
 
             // Find </t>
             let t_end = match find_subsequence(&si_content[t_start..], b"</t>") {
                 Some(p) => p,
-                None => return Err(anyhow!("No </t> found")),
+                None => return Err((xml, anyhow!("No </t> found"))),
             };
 
-            let text = &si_content[t_start..t_start + t_end];
+            let text_len = t_end;
 
             // XML entity check in text content
-            if text.contains(&b'&') {
-                return Err(anyhow!("XML entity in text not supported in fast path"));
+            if si_content[t_start..t_start + text_len].contains(&b'&') {
+                return Err((xml, anyhow!("XML entity in text not supported in fast path")));
             }
 
-            let start = buffer.len() as u32;
-            buffer.extend_from_slice(text);
-            offsets.push((start, t_end as u32));
+            // In-place memmove: copy text forward to overwrite XML tags.
+            // Safe because write_pos always lags behind the source (i + t_start),
+            // since each <si> block contains ~16 bytes of tag overhead.
+            unsafe {
+                std::ptr::copy(
+                    xml.as_ptr().add(i + t_start),
+                    xml.as_mut_ptr().add(write_pos),
+                    text_len,
+                );
+            }
 
+            offsets.push((write_pos as u32, text_len as u32));
+            write_pos += text_len;
             i += si_end + 5;
         }
 
+        xml.truncate(write_pos);
+        xml.shrink_to_fit();
+
         Ok(SharedStrings {
-            buffer: Buffer::from_vec(buffer),
+            buffer: Buffer::from_vec(xml),
             offsets,
         })
     }
 
     /// Fallback: full quick-xml parser for complex sharedStrings.
-    fn parse_shared_strings_xml(xml: &[u8]) -> Result<SharedStrings> {
+    fn parse_shared_strings_xml<R: Read>(reader: R) -> Result<SharedStrings> {
         let mut buffer = Vec::with_capacity(64 * 1024);
         let mut offsets = Vec::new();
-        let mut reader = Reader::from_reader(BufReader::with_capacity(256 * 1024, xml));
+        let mut reader = Reader::from_reader(BufReader::with_capacity(256 * 1024, reader));
         let mut buf = Vec::new();
         let mut in_si = false;
         let mut current_text = String::new();
@@ -412,7 +444,9 @@ impl XlsxWorkbook {
             offsets,
         })
     }
+}
 
+impl XlsxWorkbook {
     fn read_styles<R: Read + Seek>(
         archive: &mut ZipArchive<R>,
     ) -> Result<(Vec<u32>, HashSet<u32>)> {

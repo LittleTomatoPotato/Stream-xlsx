@@ -1,5 +1,6 @@
 use crate::{
     excel_types::{Cell, Data, Dimensions},
+    sheet_fast::SheetFastReader,
     workbook::{SharedStrings, XlsxWorkbook},
     xlsx_stream_lm::XlsxStreamReader,
 };
@@ -588,13 +589,43 @@ fn cell_value_to_header(data: Data, strings: Option<&Arc<SharedStrings>>) -> Str
     }
 }
 
-/// 单线程流式 xlsx DataFrame 迭代器。
+/// 统一两种 sheet reader 的枚举，避免 trait object 的虚函数开销。
+enum SheetReader {
+    Stream(XlsxStreamReader),
+    Fast(SheetFastReader),
+}
+
+impl SheetReader {
+    fn next_cell(&mut self) -> anyhow::Result<Option<Cell<Data>>> {
+        match self {
+            Self::Stream(r) => r.next_cell(),
+            Self::Fast(r) => r.next_cell(),
+        }
+    }
+
+    fn dimensions(&self) -> Dimensions {
+        match self {
+            Self::Stream(r) => r.dimensions(),
+            Self::Fast(r) => r.dimensions(),
+        }
+    }
+
+    fn strings(&self) -> &Arc<SharedStrings> {
+        match self {
+            Self::Stream(r) => r.strings(),
+            Self::Fast(r) => r.strings(),
+        }
+    }
+}
+
+/// 流式 xlsx DataFrame 迭代器。
 ///
-/// 底层使用独立的 `XlsxStreamReader` 直接解压并解析 sheet XML，
-/// 不依赖 calamine 的任何内部类型。
+/// 底层根据 fast 标志选择 `XlsxStreamReader`（单线程流式）或
+/// `SheetFastReader`（并发解析），不依赖 calamine。
 pub struct DataFrameIter {
     workbook: Arc<XlsxWorkbook>,
-    reader: XlsxStreamReader,
+    reader: SheetReader,
+    fast: bool,
     cols: TypedCols,
     cell_cache: Option<Cell<Data>>,
     has_header: bool,
@@ -627,7 +658,7 @@ impl DataFrameIter {
         } else {
             Arc::new(XlsxWorkbook::open(path)?)
         };
-        Self::from_workbook(batch_size, workbook, sheet_name, sheet_idx, has_header, skip_rows)
+        Self::from_workbook(batch_size, workbook, sheet_name, sheet_idx, has_header, skip_rows, fast)
     }
 
     pub fn from_workbook(
@@ -637,8 +668,17 @@ impl DataFrameIter {
         sheet_idx: Option<usize>,
         has_header: bool,
         skip_rows: Option<&[u32]>,
+        fast: bool,
     ) -> anyhow::Result<Self> {
-        let reader = XlsxStreamReader::from_workbook(Arc::clone(&workbook), sheet_name, sheet_idx)?;
+        let reader = if fast {
+            SheetReader::Fast(SheetFastReader::new(
+                workbook.path(), sheet_name, sheet_idx,
+            )?)
+        } else {
+            SheetReader::Stream(XlsxStreamReader::from_workbook(
+                Arc::clone(&workbook), sheet_name, sheet_idx,
+            )?)
+        };
         let dim = reader.dimensions();
         let batch_size = match batch_size {
             Some(s) => s,
@@ -654,6 +694,7 @@ impl DataFrameIter {
             cols,
             cell_cache: None,
             has_header,
+            fast,
             len: 0,
             batch_start_row: None,
             current_row_count: 0,
@@ -679,8 +720,15 @@ impl DataFrameIter {
         sheet_name: Option<&str>,
         sheet_idx: Option<usize>,
     ) -> anyhow::Result<()> {
-        self.reader =
-            XlsxStreamReader::from_workbook(Arc::clone(&self.workbook), sheet_name, sheet_idx)?;
+        self.reader = if self.fast {
+            SheetReader::Fast(SheetFastReader::new(
+                self.workbook.path(), sheet_name, sheet_idx,
+            )?)
+        } else {
+            SheetReader::Stream(XlsxStreamReader::from_workbook(
+                Arc::clone(&self.workbook), sheet_name, sheet_idx,
+            )?)
+        };
         let dim = self.reader.dimensions();
         let batch_size = self.cols.batch_size;
         self.cols = TypedCols::new(&dim, batch_size);
@@ -952,7 +1000,7 @@ mod multi_sheet_tests {
             .unwrap()
             .join("test_data.xlsx");
         let wb = Arc::new(XlsxWorkbook::open(&path)?);
-        let mut iter = DataFrameIter::from_workbook(Some(5), Arc::clone(&wb), Some("Sheet1"), None, true, None)?;
+        let mut iter = DataFrameIter::from_workbook(Some(5), Arc::clone(&wb), Some("Sheet1"), None, true, None, false)?;
 
         let df1 = iter.next().unwrap()?;
         let rows1 = df1.height();

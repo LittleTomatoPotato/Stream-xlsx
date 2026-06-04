@@ -1,5 +1,6 @@
 use crate::excel_types::{Cell, Data, Dimensions};
 use crate::utils::*;
+use crate::workbook::SharedStrings;
 use anyhow::{Result, anyhow};
 use crossbeam_channel::bounded;
 use polars::datatypes::PlSmallStr;
@@ -27,6 +28,8 @@ pub struct SheetFastReader {
     pending: Vec<(usize, Cell<Data>)>,
     pending_idx: usize,
     _handles: Vec<std::thread::JoinHandle<()>>,
+    strings: Arc<SharedStrings>,
+    dimensions: Dimensions,
 }
 
 impl SheetFastReader {
@@ -57,18 +60,15 @@ impl SheetFastReader {
             let mut f = archive.by_name(&sheet_path)?;
             let size = f.size() as usize;
             let mut buf = Vec::with_capacity(size);
-            let mut temp = vec![0u8; 1024 * 1024];
-            loop {
-                let n = f.read(&mut temp)?;
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&temp[..n]);
-            }
+            f.read_to_end(&mut buf)?;
             Arc::new(buf)
         };
 
-        // 2. 扫描 <c> boundaries
+        // 2. 解析 dimension 和 shared strings
+        let dimensions = parse_dimensions(&xml).unwrap_or_default();
+        let strings = Arc::clone(workbook.strings().unwrap());
+
+        // 3. 扫描 <c> boundaries
         let boundaries = scan_cell_boundaries(&xml);
         let total_cells = boundaries.len();
 
@@ -107,7 +107,7 @@ impl SheetFastReader {
                 while let Ok(chunk) = task_rx2.recv() {
                     let mut batch = Vec::with_capacity(chunk.len());
                     for (seq, start, end) in chunk {
-                        let raw = &xml2[start..end];
+                        let raw = &xml2[start as usize..end as usize];
                         let cell = parse_cell_fragment(raw, seq)
                             .unwrap_or_else(|_| Cell::new((0, 0), Data::Empty));
                         batch.push((seq, cell));
@@ -129,11 +129,17 @@ impl SheetFastReader {
             pending: Vec::new(),
             pending_idx: 0,
             _handles: handles,
+            strings,
+            dimensions,
         })
     }
 
     pub fn dimensions(&self) -> Dimensions {
-        Dimensions::default()
+        self.dimensions
+    }
+
+    pub fn strings(&self) -> &Arc<SharedStrings> {
+        &self.strings
     }
 
     pub fn total_cells(&self) -> usize {
@@ -206,17 +212,38 @@ impl SheetFastReader {
 // XML boundary scanner — pure byte scan, no attribute parsing
 // ------------------------------------------------------------------
 
-fn scan_cell_boundaries(xml: &[u8]) -> Vec<(usize, usize)> {
-    let mut boundaries = Vec::with_capacity(xml.len() / 200);
-    let mut i = 0;
+fn parse_dimensions(xml: &[u8]) -> Result<Dimensions> {
+    let dim_open = find_subsequence(xml, b"<dimension ");
+    let dim_empty = find_subsequence(xml, b"<dimension");
+    let start = match (dim_open, dim_empty) {
+        (Some(p), _) => p + 11, // len(b"<dimension ")
+        (None, Some(p)) => p + 10, // len(b"<dimension")
+        (None, None) => return Ok(Dimensions::default()),
+    };
+    let rest = &xml[start..];
+    let tag_end = rest.iter().position(|&b| b == b'>').unwrap_or(rest.len());
+    let attrs = &rest[..tag_end];
+    if let Some(r_pos) = find_subsequence(attrs, b"ref=\"") {
+        let r_start = r_pos + 5;
+        if let Some(r_end) = attrs[r_start..].iter().position(|&b| b == b'"') {
+            return crate::utils::parse_dimension(&attrs[r_start..r_start + r_end]);
+        }
+    }
+    Ok(Dimensions::default())
+}
 
-    while i + 2 < xml.len() {
+fn scan_cell_boundaries(xml: &[u8]) -> Vec<(u32, u32)> {
+    let mut boundaries = Vec::with_capacity(xml.len() / 200);
+    let mut i = 0usize;
+    let xml_len = xml.len();
+
+    while i + 2 < xml_len {
         if xml[i] == b'<' && xml[i + 1] == b'c' && (xml[i + 2] == b' ' || xml[i + 2] == b'>') {
-            let c_start = i;
+            let c_start = i as u32;
             let mut j = i + 2;
             let mut self_closing = false;
 
-            while j + 1 < xml.len() {
+            while j + 1 < xml_len {
                 if xml[j] == b'/' && xml[j + 1] == b'>' {
                     self_closing = true;
                     j += 2;
@@ -230,12 +257,12 @@ fn scan_cell_boundaries(xml: &[u8]) -> Vec<(usize, usize)> {
             }
 
             if self_closing {
-                boundaries.push((c_start, j));
+                boundaries.push((c_start, j as u32));
                 i = j;
                 continue;
             }
 
-            while j + 3 < xml.len() {
+            while j + 3 < xml_len {
                 if xml[j] == b'<'
                     && xml[j + 1] == b'/'
                     && xml[j + 2] == b'c'
@@ -246,7 +273,7 @@ fn scan_cell_boundaries(xml: &[u8]) -> Vec<(usize, usize)> {
                 }
                 j += 1;
             }
-            boundaries.push((c_start, j));
+            boundaries.push((c_start, j as u32));
             i = j;
         } else {
             i += 1;

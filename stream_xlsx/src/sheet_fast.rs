@@ -32,7 +32,7 @@ pub struct SheetFastReader {
 impl SheetFastReader {
     /// Open a sheet and start background parsing.
     pub fn new(path: &Path, sheet_name: Option<&str>, sheet_idx: Option<usize>) -> Result<Self> {
-        let workbook = crate::workbook::XlsxWorkbook::open(path)?;
+        let workbook = crate::workbook::XlsxWorkbook::open_fast(path)?;
         workbook.init()?;
         let sheet_path = match (sheet_name, sheet_idx) {
             (Some(name), _) => workbook

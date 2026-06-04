@@ -68,13 +68,20 @@ impl XlsxWorkbook {
         }
 
         if self.fast_shared_strings {
-            // Fast path: decompress sharedStrings.xml fully, then parse in-place.
-            // Avoids the accumulate-copy overhead of parse_shared_strings_concurrent.
-            let file = std::fs::File::open(&self.path)?;
-            let reader = BufReader::new(file);
-            let mut archive = ZipArchive::new(reader)?;
-            let strings = Arc::new(Self::read_shared_strings(&mut archive, true)?);
-            let _ = self.strings.set(strings);
+            // Concurrent fast path: decompress in a background thread while the
+            // main thread parses.  Falls back to serial fast path on error.
+            match Self::parse_shared_strings_concurrent(&self.path) {
+                Ok(strings) => {
+                    let _ = self.strings.set(Arc::new(strings));
+                }
+                Err(_e) => {
+                    let file = std::fs::File::open(&self.path)?;
+                    let reader = BufReader::new(file);
+                    let mut archive = ZipArchive::new(reader)?;
+                    let strings = Arc::new(Self::read_shared_strings(&mut archive, true)?);
+                    let _ = self.strings.set(strings);
+                }
+            }
         } else {
             let file = std::fs::File::open(&self.path)?;
             let reader = BufReader::new(file);
@@ -238,14 +245,7 @@ impl XlsxWorkbook {
                 let estimated = (file.compressed_size() as usize).saturating_mul(5);
                 Vec::with_capacity(estimated.max(64 * 1024))
             };
-            // Chunked read: ZipFile::read_to_end is slow because each read()
-            // returns small blocks, causing excessive loop iterations.
-            let mut temp = vec![0u8; 1024 * 1024];
-            loop {
-                let n = file.read(&mut temp)?;
-                if n == 0 { break; }
-                xml.extend_from_slice(&temp[..n]);
-            }
+            file.read_to_end(&mut xml)?;
             match Self::parse_shared_strings_fast(xml) {
                 Ok(result) => return Ok(result),
                 Err((xml, _e)) => {

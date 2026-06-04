@@ -36,3 +36,4 @@ test_data.xlsx
 .codegraph/.gitignore
 .codegraph/
 .cursor/rules/codegraph.mdc
+test_small.xlsx

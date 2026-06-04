@@ -234,6 +234,30 @@ main thread (按 seq 顺序重组 + 输出 DataFrame)
 - `MutablePlString::push_value` + `freeze()` 封装为 `Utf8ViewArray`,**只标记所有权,不复制**
 - `DataFrame::from_chunks` 零拷贝持有 Arrow 数组
 
+## 局限性与已知问题
+
+### 标题行仅支持单行
+
+`has_header=True` 时,只把**第一行**作为列名。多级表头(例如合并单元格跨越两行形成"分类 + 字段"两层结构)目前**不支持**——会被当成数据行处理,导致第一行表头被合并到字符串列里。`skip_rows` 参数用于跳过数据行,对多级表头无帮助。
+
+如需处理多级表头,可在读取后用 Polars 自行重塑列名,或预处理 xlsx 把多级表头合并为一行。
+
+### fast 模式共享字符串解析是简化版
+
+为追求速度,fast 模式只识别最简单的 `<si><t>...</t></si>` 模式。**遇到以下情况会**回退**到 default 模式的 streaming quick-xml 解析器**:
+
+| XML 模式 | 示例 | fast 模式行为 |
+|----------|------|--------------|
+| 富文本(rich text) | `<si><r><t>bold</t></r><r><t>normal</t></r></si>` | ❌ 回退 |
+| CDATA 区段 | `<si><t><![CDATA[<value>]]></t></si>` | ❌ 回退 |
+| XML 实体 | `<si><t>a &amp; b</t></si>` | ❌ 回退 |
+| 多 `<t>` 节点 | `<si><t>part1</t><t>part2</t></si>` | ❌ 回退 |
+| 简单纯文本 | `<si><t>hello</t></si>` | ✅ 走快路径 |
+
+**实际影响**:绝大多数由 Excel / WPS / Google Sheets 生成的 xlsx 文件用 simple 模式,fast 路径可覆盖 99%+ 场景。回退到 slow path 仅在共享字符串表本身较慢,**不影响 95% 时间的 sheet XML 解析**(那才是 fast 模式的真正优化点)。
+
+如确需 fast 模式处理上述复杂情况,可手动将 xlsx 的 `sharedStrings.xml` "扁平化"(用 LibreOffice 重新保存通常就够了)。
+
 ## 构建
 
 ### 开发构建

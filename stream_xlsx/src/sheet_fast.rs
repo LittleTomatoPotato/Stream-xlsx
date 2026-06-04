@@ -2,6 +2,7 @@ use crate::excel_types::{Cell, Data, Dimensions};
 use crate::utils::*;
 use crate::workbook::SharedStrings;
 use anyhow::{Result, anyhow};
+use bytes::{Bytes, BytesMut};
 use crossbeam_channel::bounded;
 use polars::datatypes::PlSmallStr;
 use std::collections::HashMap;
@@ -33,7 +34,7 @@ pub struct SheetFastReader {
 }
 
 impl SheetFastReader {
-    /// Open a sheet and start background parsing.
+    /// Open a sheet and start background parsing (streaming: unzip + scan on the fly).
     pub fn new(path: &Path, sheet_name: Option<&str>, sheet_idx: Option<usize>) -> Result<Self> {
         let workbook = crate::workbook::XlsxWorkbook::open_fast(path)?;
         workbook.init()?;
@@ -52,63 +53,224 @@ impl SheetFastReader {
                 .to_string(),
         };
 
-        // 1. 一次性解压 sheet XML（分块读取避免 read_to_end 的逐字节循环开销）
-        let xml = {
+        // 1. 快速读取 XML 头部解析 dimensions（不需要完整解压）
+        let dimensions = {
             let file = std::fs::File::open(path)?;
             let reader = BufReader::with_capacity(1024 * 1024, file);
             let mut archive = zip::ZipArchive::new(reader)?;
             let mut f = archive.by_name(&sheet_path)?;
-            let size = f.size() as usize;
-            let mut buf = Vec::with_capacity(size);
-            f.read_to_end(&mut buf)?;
-            Arc::new(buf)
+            let mut head = vec![0u8; 8192];
+            let n = f.read(&mut head)?;
+            parse_dimensions(&head[..n]).unwrap_or_default()
         };
-
-        // 2. 解析 dimension 和 shared strings
-        let dimensions = parse_dimensions(&xml).unwrap_or_default();
         let strings = Arc::clone(workbook.strings().unwrap());
-
-        // 3. 扫描 <c> boundaries
-        let boundaries = scan_cell_boundaries(&xml);
-        let total_cells = boundaries.len();
 
         let (task_tx, task_rx) = bounded(QUEUE_CAP);
         let (result_tx, result_rx) = bounded(QUEUE_CAP);
         let mut handles = Vec::new();
 
-        // 3. 切分线程：按 CHUNK_SIZE 组装 chunk，直接发送到 1:N 工作管道
-        let boundaries = Arc::new(boundaries);
-        let boundaries2 = Arc::clone(&boundaries);
-        let task_tx2 = task_tx.clone();
+        // 2. 解压 + 扫描 + dispatch 线程（单线程，边读边扫）
+        let path2 = path.to_path_buf();
+        let sheet_path2 = sheet_path.clone();
         handles.push(std::thread::spawn(move || {
+            let file = std::fs::File::open(&path2).unwrap();
+            let reader = BufReader::with_capacity(1024 * 1024, file);
+            let mut archive = zip::ZipArchive::new(reader).unwrap();
+            let mut f = archive.by_name(&sheet_path2).unwrap();
+            let mut accumulate = BytesMut::with_capacity(8 * 1024 * 1024);
+            let mut temp = vec![0u8; 1024 * 1024];
             let mut seq = 0usize;
-            let mut chunk = Vec::with_capacity(CHUNK_SIZE);
-            for &(start, end) in boundaries2.iter() {
-                chunk.push((seq, start, end));
-                seq += 1;
-                if chunk.len() >= CHUNK_SIZE {
-                    let old = std::mem::replace(&mut chunk, Vec::with_capacity(CHUNK_SIZE));
-                    if task_tx2.send(old).is_err() {
-                        break;
+            let mut chunk: Vec<(usize, Bytes)> = Vec::with_capacity(CHUNK_SIZE);
+
+            loop {
+                let n = f.read(&mut temp).unwrap();
+                if n == 0 {
+                    break;
+                }
+
+                accumulate.extend_from_slice(&temp[..n]);
+                let mut i = 0;
+
+                while i + 2 < accumulate.len() {
+                    if accumulate[i] == b'<'
+                        && accumulate[i + 1] == b'c'
+                        && (accumulate[i + 2] == b' ' || accumulate[i + 2] == b'>')
+                    {
+                        let c_start = i;
+                        let mut j = i + 2;
+                        let mut self_closing = false;
+
+                        while j + 1 < accumulate.len() {
+                            if accumulate[j] == b'/' && accumulate[j + 1] == b'>' {
+                                self_closing = true;
+                                j += 2;
+                                break;
+                            }
+                            if accumulate[j] == b'>' {
+                                j += 1;
+                                break;
+                            }
+                            j += 1;
+                        }
+
+                        if self_closing {
+                            if c_start > 0 {
+                                let _garbage = accumulate.split_to(c_start);
+                                j -= c_start;
+                            }
+                            let cell = accumulate.split_to(j).freeze();
+                            chunk.push((seq, cell));
+                            seq += 1;
+                            i = 0;
+                            if chunk.len() >= CHUNK_SIZE {
+                                let old = std::mem::replace(
+                                    &mut chunk,
+                                    Vec::with_capacity(CHUNK_SIZE),
+                                );
+                                if task_tx.send(old).is_err() {
+                                    return;
+                                }
+                            }
+                            continue;
+                        }
+
+                        if j >= accumulate.len() {
+                            break;
+                        }
+
+                        let mut found_close = false;
+                        while j + 3 < accumulate.len() {
+                            if accumulate[j] == b'<'
+                                && accumulate[j + 1] == b'/'
+                                && accumulate[j + 2] == b'c'
+                                && accumulate[j + 3] == b'>'
+                            {
+                                j += 4;
+                                found_close = true;
+                                break;
+                            }
+                            j += 1;
+                        }
+
+                        if !found_close {
+                            break;
+                        }
+
+                        if c_start > 0 {
+                            let _garbage = accumulate.split_to(c_start);
+                            j -= c_start;
+                        }
+                        let cell = accumulate.split_to(j).freeze();
+                        chunk.push((seq, cell));
+                        seq += 1;
+                        i = 0;
+                        if chunk.len() >= CHUNK_SIZE {
+                            let old =
+                                std::mem::replace(&mut chunk, Vec::with_capacity(CHUNK_SIZE));
+                            if task_tx.send(old).is_err() {
+                                return;
+                            }
+                        }
+                    } else {
+                        i += 1;
                     }
                 }
+
+                // break 后，丢弃已扫描的垃圾，保留不完整 cell
+                if i > 0 && i < accumulate.len() {
+                    let _garbage = accumulate.split_to(i);
+                }
             }
+
+            // 最终扫描：read 返回 0 后处理剩余数据
+            let mut i = 0;
+            while i + 2 < accumulate.len() {
+                if accumulate[i] == b'<'
+                    && accumulate[i + 1] == b'c'
+                    && (accumulate[i + 2] == b' ' || accumulate[i + 2] == b'>')
+                {
+                    let c_start = i;
+                    let mut j = i + 2;
+                    let mut self_closing = false;
+
+                    while j + 1 < accumulate.len() {
+                        if accumulate[j] == b'/' && accumulate[j + 1] == b'>' {
+                            self_closing = true;
+                            j += 2;
+                            break;
+                        }
+                        if accumulate[j] == b'>' {
+                            j += 1;
+                            break;
+                        }
+                        j += 1;
+                    }
+
+                    if self_closing {
+                        if c_start > 0 {
+                            let _garbage = accumulate.split_to(c_start);
+                            j -= c_start;
+                        }
+                        let cell = accumulate.split_to(j).freeze();
+                        chunk.push((seq, cell));
+                        seq += 1;
+                        i = 0;
+                        if chunk.len() >= CHUNK_SIZE {
+                            let old = std::mem::replace(&mut chunk, Vec::with_capacity(CHUNK_SIZE));
+                            if task_tx.send(old).is_err() { return; }
+                        }
+                        continue;
+                    }
+
+                    if j >= accumulate.len() { break; }
+
+                    let mut found_close = false;
+                    while j + 3 < accumulate.len() {
+                        if accumulate[j] == b'<'
+                            && accumulate[j + 1] == b'/'
+                            && accumulate[j + 2] == b'c'
+                            && accumulate[j + 3] == b'>'
+                        {
+                            j += 4;
+                            found_close = true;
+                            break;
+                        }
+                        j += 1;
+                    }
+
+                    if !found_close { break; }
+
+                    if c_start > 0 {
+                        let _garbage = accumulate.split_to(c_start);
+                        j -= c_start;
+                    }
+                    let cell = accumulate.split_to(j).freeze();
+                    chunk.push((seq, cell));
+                    seq += 1;
+                    i = 0;
+                    if chunk.len() >= CHUNK_SIZE {
+                        let old = std::mem::replace(&mut chunk, Vec::with_capacity(CHUNK_SIZE));
+                        if task_tx.send(old).is_err() { return; }
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+
             if !chunk.is_empty() {
-                let _ = task_tx2.send(chunk);
+                let _ = task_tx.send(chunk);
             }
         }));
 
-        // 4. 工作线程（N 个）：共享 task_rx，竞争 recv，解析后批量发送结果
+        // 3. 工作线程（N 个）：解析 cell fragment
         for _ in 0..PARALLELISM {
             let task_rx2 = task_rx.clone();
             let result_tx2 = result_tx.clone();
-            let xml2 = Arc::clone(&xml);
             handles.push(std::thread::spawn(move || {
                 while let Ok(chunk) = task_rx2.recv() {
                     let mut batch = Vec::with_capacity(chunk.len());
-                    for (seq, start, end) in chunk {
-                        let raw = &xml2[start as usize..end as usize];
-                        let cell = parse_cell_fragment(raw, seq)
+                    for (seq, raw) in chunk {
+                        let cell = parse_cell_fragment(&raw, seq)
                             .unwrap_or_else(|_| Cell::new((0, 0), Data::Empty));
                         batch.push((seq, cell));
                     }
@@ -124,7 +286,7 @@ impl SheetFastReader {
         Ok(Self {
             result_rx,
             next_expected: 0,
-            total_cells,
+            total_cells: 0,
             buffer: HashMap::new(),
             pending: Vec::new(),
             pending_idx: 0,
@@ -148,7 +310,7 @@ impl SheetFastReader {
 
     /// Consume the next cell in strict ascending index order.
     pub fn next_cell(&mut self) -> Result<Option<Cell<Data>>> {
-        if self.next_expected >= self.total_cells {
+        if self.total_cells > 0 && self.next_expected >= self.total_cells {
             return Ok(None);
         }
 
@@ -445,10 +607,6 @@ mod tests {
         eprintln!("{}", sep);
     }
 
-    // ------------------------------------------------------------------
-    // Streaming prototype: decompress + scan + dispatch in one thread,
-    // send cell-fragment copies to workers.  Lower peak memory.
-    // ------------------------------------------------------------------
     #[test]
     fn profile_sheet_fast_streaming() {
         let path = Path::new(TEST_FILE);
@@ -459,324 +617,32 @@ mod tests {
 
         let sep: String = std::iter::repeat('=').take(60).collect();
         eprintln!("\n{}", sep);
-        eprintln!("SheetFastReader STREAMING prototype (batch CHUNK_SIZE={})", CHUNK_SIZE);
+        eprintln!("SheetFastReader STREAMING (zero-copy)  [CHUNK_SIZE={}]", CHUNK_SIZE);
         eprintln!("Baseline reference: 14.4s  [cells=59500954]");
         eprintln!("{}", sep);
 
-        let t_total = Instant::now();
+        {
+            let t_new = Instant::now();
+            let mut reader = SheetFastReader::new(path, None, Some(0)).unwrap();
+            let new_elapsed = t_new.elapsed().as_secs_f64();
+            eprintln!(
+                "C. Streaming::new()                : {:.3}s  (includes unzip+scan+dispatch start)",
+                new_elapsed
+            );
 
-        let workbook = crate::workbook::XlsxWorkbook::open_fast(path).unwrap();
-        workbook.init().unwrap();
-        let sheet_path = workbook
-            .sheet_path_by_idx(0)
-            .ok_or_else(|| anyhow!("sheet 0 not found"))
-            .unwrap()
-            .to_string();
-
-
-        let (task_tx, task_rx) = bounded(QUEUE_CAP);
-        let (result_tx, result_rx) = bounded(QUEUE_CAP);
-
-
-
-        // 解压 + 扫描 + 分发线程（单线程，边读边扫）
-        let path2 = path.to_path_buf();
-        std::thread::spawn(move || {
-            let file = std::fs::File::open(&path2).unwrap();
-            let reader = std::io::BufReader::with_capacity(1024 * 1024, file);
-            let mut archive = zip::ZipArchive::new(reader).unwrap();
-            let mut f = archive.by_name(&sheet_path).unwrap();
-            let mut accumulate = Vec::with_capacity(2 * 1024 * 1024);
-            let mut temp = vec![0u8; 1024 * 1024];
-            let mut seq = 0usize;
-            let mut chunk = Vec::with_capacity(CHUNK_SIZE);
-            let mut truncated = true; // 第一次循环从 0 开始扫描
-
-            loop {
-                let n = f.read(&mut temp).unwrap();
-                if n == 0 {
-                    break;
-                }
-
-                let prev_len = accumulate.len();
-                accumulate.extend_from_slice(&temp[..n]);
-                let mut i = if truncated || prev_len < 3 {
-                    0
-                } else {
-                    prev_len.saturating_sub(3)
-                };
-                truncated = false;
-
-                while i + 2 < accumulate.len() {
-                    if accumulate[i] == b'<'
-                        && accumulate[i + 1] == b'c'
-                        && (accumulate[i + 2] == b' ' || accumulate[i + 2] == b'>')
-                    {
-                        let c_start = i;
-                        let mut j = i + 2;
-                        let mut self_closing = false;
-
-                        while j + 1 < accumulate.len() {
-                            if accumulate[j] == b'/' && accumulate[j + 1] == b'>' {
-                                self_closing = true;
-                                j += 2;
-                                break;
-                            }
-                            if accumulate[j] == b'>' {
-                                j += 1;
-                                break;
-                            }
-                            j += 1;
-                        }
-
-                        if self_closing {
-                            chunk.push((seq, accumulate[c_start..j].to_vec()));
-                            seq += 1;
-                            i = j;
-                            if chunk.len() >= CHUNK_SIZE {
-                                let old = std::mem::replace(
-                                    &mut chunk,
-                                    Vec::with_capacity(CHUNK_SIZE),
-                                );
-                                if task_tx.send(old).is_err() {
-                                    return;
-                                }
-                            }
-                            continue;
-                        }
-
-                        if j >= accumulate.len() {
-                            break;
-                        }
-
-                        let mut found_close = false;
-                        while j + 3 < accumulate.len() {
-                            if accumulate[j] == b'<'
-                                && accumulate[j + 1] == b'/'
-                                && accumulate[j + 2] == b'c'
-                                && accumulate[j + 3] == b'>'
-                            {
-                                j += 4;
-                                found_close = true;
-                                break;
-                            }
-                            j += 1;
-                        }
-
-                        if !found_close {
-                            break;
-                        }
-
-                        chunk.push((seq, accumulate[c_start..j].to_vec()));
-                        seq += 1;
-                        i = j;
-                        if chunk.len() >= CHUNK_SIZE {
-                            let old =
-                                std::mem::replace(&mut chunk, Vec::with_capacity(CHUNK_SIZE));
-                            if task_tx.send(old).is_err() {
-                                return;
-                            }
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
-
-                // 截断：以最后一个完整的 </c> 或 /> 为界，确保标签不被拆开
-                if let Some(end) = last_complete_cell_end(&accumulate[..i]) {
-                    let remaining = accumulate.split_off(end);
-                    accumulate = remaining;
-                    truncated = true;
-                }
-            }
-
-            // 最终扫描：read 返回 0 后处理剩余数据
-            let mut i = 0;
-            while i + 2 < accumulate.len() {
-                if accumulate[i] == b'<'
-                    && accumulate[i + 1] == b'c'
-                    && (accumulate[i + 2] == b' ' || accumulate[i + 2] == b'>')
-                {
-                    let c_start = i;
-                    let mut j = i + 2;
-                    let mut self_closing = false;
-
-                    while j + 1 < accumulate.len() {
-                        if accumulate[j] == b'/' && accumulate[j + 1] == b'>' {
-                            self_closing = true;
-                            j += 2;
-                            break;
-                        }
-                        if accumulate[j] == b'>' {
-                            j += 1;
-                            break;
-                        }
-                        j += 1;
-                    }
-
-                    if self_closing {
-                        chunk.push((seq, accumulate[c_start..j].to_vec()));
-                        seq += 1;
-                        i = j;
-                        if chunk.len() >= CHUNK_SIZE {
-                            let old = std::mem::replace(&mut chunk, Vec::with_capacity(CHUNK_SIZE));
-                            if task_tx.send(old).is_err() { return; }
-                        }
-                        continue;
-                    }
-
-                    if j >= accumulate.len() { break; }
-
-                    let mut found_close = false;
-                    while j + 3 < accumulate.len() {
-                        if accumulate[j] == b'<'
-                            && accumulate[j + 1] == b'/'
-                            && accumulate[j + 2] == b'c'
-                            && accumulate[j + 3] == b'>'
-                        {
-                            j += 4;
-                            found_close = true;
-                            break;
-                        }
-                        j += 1;
-                    }
-
-                    if !found_close { break; }
-
-                    chunk.push((seq, accumulate[c_start..j].to_vec()));
-                    seq += 1;
-                    i = j;
-                    if chunk.len() >= CHUNK_SIZE {
-                        let old = std::mem::replace(&mut chunk, Vec::with_capacity(CHUNK_SIZE));
-                        if task_tx.send(old).is_err() { return; }
-                    }
-                } else {
-                    i += 1;
-                }
-            }
-
-            if !chunk.is_empty() {
-                let _ = task_tx.send(chunk);
-            }
-        });
-
-        // 工作线程（N 个）：解析 cell fragment 拷贝
-        for _ in 0..PARALLELISM {
-            let task_rx2 = task_rx.clone();
-            let result_tx2 = result_tx.clone();
-            std::thread::spawn(move || {
-                while let Ok(chunk) = task_rx2.recv() {
-                    let mut batch = Vec::with_capacity(chunk.len());
-                    for (seq, raw) in chunk {
-                        let cell = parse_cell_fragment(&raw, seq)
-                            .unwrap_or_else(|_| Cell::new((0, 0), Data::Empty));
-                        batch.push((seq, cell));
-                    }
-                    if result_tx2.send(batch).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-        drop(task_rx);
-        drop(result_tx);
-
-        let new_elapsed = t_total.elapsed().as_secs_f64();
-        eprintln!(
-            "C. Streaming::new()                : {:.3}s  (includes unzip+scan+dispatch start)",
-            new_elapsed
-        );
-
-        let t_read = Instant::now();
-        let mut count = 0usize;
-        let mut next_expected = 0usize;
-        let mut buffer = HashMap::new();
-        let mut pending = Vec::new();
-        let mut pending_idx = 0;
-        let mut pipe_closed = false;
-
-        loop {
-            // 优先从 pending batch 顺序消费
-            if pending_idx < pending.len() {
-                let (seq, _) = pending[pending_idx];
-                if seq == next_expected {
-                    pending_idx += 1;
-                    next_expected += 1;
-                    count += 1;
-                    continue;
-                }
-                pending.clear();
-                pending_idx = 0;
-            }
-
-            // 检查排序缓冲
-            if let Some(_) = buffer.remove(&next_expected) {
-                next_expected += 1;
+            let t_read = Instant::now();
+            let mut count = 0usize;
+            while let Ok(Some(_cell)) = reader.next_cell() {
                 count += 1;
-                continue;
             }
-
-            if pipe_closed && buffer.is_empty() {
-                break;
-            }
-
-            // 从结果管道 recv batch
-            match result_rx.recv() {
-                Ok(batch) => {
-                    if batch.is_empty() {
-                        continue;
-                    }
-                    if batch[0].0 == next_expected {
-                        pending = batch;
-                        pending_idx = 1;
-                        next_expected += 1;
-                        count += 1;
-                        continue;
-                    }
-                    for (seq, cell) in batch {
-                        buffer.insert(seq, cell);
-                    }
-                    if let Some(_) = buffer.remove(&next_expected) {
-                        next_expected += 1;
-                        count += 1;
-                        continue;
-                    }
-                }
-                Err(_) => {
-                    pipe_closed = true;
-                    continue;
-                }
-            }
+            eprintln!(
+                "C. Streaming (concurrent)        : {:.3}s  [cells={}]",
+                t_read.elapsed().as_secs_f64(),
+                count
+            );
         }
-
-        eprintln!(
-            "C. Streaming (concurrent)        : {:.3}s  [cells={}]",
-            t_read.elapsed().as_secs_f64(),
-            count
-        );
 
         eprintln!("{}", sep);
     }
-}
-
-/// 找到 data 中最后一个完整的 cell 结束位置（</c> 或 <c .../>）。
-/// 用于流式扫描的安全截断，确保不会拆开标签。
-fn last_complete_cell_end(data: &[u8]) -> Option<usize> {
-    for pos in (0..data.len()).rev() {
-        if data[pos] == b'>' {
-            if pos >= 3 && &data[pos - 3..=pos] == b"</c>" {
-                return Some(pos + 1);
-            }
-            if pos >= 1 && &data[pos - 1..=pos] == b"/>" {
-                // 往前找 <c，确认是 cell 的自关闭标签
-                if let Some(lt) = data[..pos].iter().rposition(|&b| b == b'<') {
-                    if lt + 1 < data.len() && data[lt + 1] == b'c' {
-                        return Some(pos + 1);
-                    }
-                }
-            }
-        }
-    }
-    None
 }
 

@@ -40,3 +40,4 @@ test_small.xlsx
 */**/*.csv
 */**/*.json
 benchmark_parallelism_results.csv
+benchmark_buffer_results.csv

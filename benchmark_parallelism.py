@@ -40,7 +40,7 @@ def main():
         sys.exit(1)
 
     # 测试的并发数范围，覆盖单核到超订
-    parallelism_values = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 16]
+    parallelism_values = [1, 2, 3, 4, 5, 6, 7, 8]
     batch_size = 10000  # 固定 batch size，减少变量
 
     print(f"\n{'=' * 60}")

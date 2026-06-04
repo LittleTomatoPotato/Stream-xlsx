@@ -345,7 +345,7 @@ dependencies = [
     { name = "polars" },
 ]
 wheels = [
-    { filename = "stream_xlsx_py-0.2.0-cp39-abi3-macosx_11_0_arm64.whl", hash = "sha256:3e6d6d77f1b784c45ba8e583adff90ea1d6ea14e1778a045012830cd51bb4adc" },
+    { filename = "stream_xlsx_py-0.2.0-cp39-abi3-macosx_11_0_arm64.whl", hash = "sha256:18c3bcf22104896277e8c52796a9365b740ed24ed25356f31ed0801d8a5cf9e1" },
 ]
 
 [package.metadata]

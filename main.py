@@ -6,28 +6,14 @@ def main():
     start = time.time()
     # 用我们的 Rust 流式库读取
     print("=== stream_xlsx (惰性迭代器) ===")
-    reader = stream_xlsx_py.read_xlsx("target/release/test_data_1m.xslx")
+    reader = stream_xlsx_py.read_xlsx(
+        "test_100w_60c.xlsx", batch_size=100000, fast=True
+    )
     count = 0
     for df in reader:
-        count += 1
-        # print(df)
+        print(df)
     print(count, time.time() - start)
 
 
-def polars_read():
-    import time
-
-    import polars as pl
-
-    start = time.time()
-    _df = pl.read_excel("target/release/test_data_1m.xslx")
-    print(time.time() - start)
-
-
 if __name__ == "__main__":
-    # main()
-    # polars_read()
-    import polars as pl
-
-    df = pl.read_parquet("test_data.parquet")
-    print(df)
+    main()

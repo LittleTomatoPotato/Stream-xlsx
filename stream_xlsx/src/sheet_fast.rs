@@ -477,16 +477,7 @@ mod tests {
         let (task_tx, task_rx) = bounded(QUEUE_CAP);
         let (result_tx, result_rx) = bounded(QUEUE_CAP);
 
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let scan_count = Arc::new(AtomicUsize::new(0));
-        let task_send_count = Arc::new(AtomicUsize::new(0));
-        let parse_ok_count = Arc::new(AtomicUsize::new(0));
-        let parse_err_count = Arc::new(AtomicUsize::new(0));
-        let result_send_count = Arc::new(AtomicUsize::new(0));
-        let consume_count = Arc::new(AtomicUsize::new(0));
 
-        let scan_count2 = Arc::clone(&scan_count);
-        let task_send_count2 = Arc::clone(&task_send_count);
 
         // 解压 + 扫描 + 分发线程（单线程，边读边扫）
         let path2 = path.to_path_buf();
@@ -540,11 +531,9 @@ mod tests {
 
                         if self_closing {
                             chunk.push((seq, accumulate[c_start..j].to_vec()));
-                            scan_count2.fetch_add(1, Ordering::Relaxed);
                             seq += 1;
                             i = j;
                             if chunk.len() >= CHUNK_SIZE {
-                                task_send_count2.fetch_add(chunk.len(), Ordering::Relaxed);
                                 let old = std::mem::replace(
                                     &mut chunk,
                                     Vec::with_capacity(CHUNK_SIZE),
@@ -579,11 +568,9 @@ mod tests {
                         }
 
                         chunk.push((seq, accumulate[c_start..j].to_vec()));
-                        scan_count2.fetch_add(1, Ordering::Relaxed);
                         seq += 1;
                         i = j;
                         if chunk.len() >= CHUNK_SIZE {
-                            task_send_count2.fetch_add(chunk.len(), Ordering::Relaxed);
                             let old =
                                 std::mem::replace(&mut chunk, Vec::with_capacity(CHUNK_SIZE));
                             if task_tx.send(old).is_err() {
@@ -629,11 +616,9 @@ mod tests {
 
                     if self_closing {
                         chunk.push((seq, accumulate[c_start..j].to_vec()));
-                        scan_count2.fetch_add(1, Ordering::Relaxed);
                         seq += 1;
                         i = j;
                         if chunk.len() >= CHUNK_SIZE {
-                            task_send_count2.fetch_add(chunk.len(), Ordering::Relaxed);
                             let old = std::mem::replace(&mut chunk, Vec::with_capacity(CHUNK_SIZE));
                             if task_tx.send(old).is_err() { return; }
                         }
@@ -659,11 +644,9 @@ mod tests {
                     if !found_close { break; }
 
                     chunk.push((seq, accumulate[c_start..j].to_vec()));
-                    scan_count2.fetch_add(1, Ordering::Relaxed);
                     seq += 1;
                     i = j;
                     if chunk.len() >= CHUNK_SIZE {
-                        task_send_count2.fetch_add(chunk.len(), Ordering::Relaxed);
                         let old = std::mem::replace(&mut chunk, Vec::with_capacity(CHUNK_SIZE));
                         if task_tx.send(old).is_err() { return; }
                     }
@@ -673,38 +656,22 @@ mod tests {
             }
 
             if !chunk.is_empty() {
-                task_send_count2.fetch_add(chunk.len(), Ordering::Relaxed);
                 let _ = task_tx.send(chunk);
             }
         });
 
         // 工作线程（N 个）：解析 cell fragment 拷贝
-        let parse_ok_count2 = Arc::clone(&parse_ok_count);
-        let parse_err_count2 = Arc::clone(&parse_err_count);
-        let result_send_count2 = Arc::clone(&result_send_count);
         for _ in 0..PARALLELISM {
             let task_rx2 = task_rx.clone();
             let result_tx2 = result_tx.clone();
-            let parse_ok_count3 = Arc::clone(&parse_ok_count2);
-            let parse_err_count3 = Arc::clone(&parse_err_count2);
-            let result_send_count3 = Arc::clone(&result_send_count2);
             std::thread::spawn(move || {
                 while let Ok(chunk) = task_rx2.recv() {
                     let mut batch = Vec::with_capacity(chunk.len());
                     for (seq, raw) in chunk {
-                        let cell = match parse_cell_fragment(&raw, seq) {
-                            Ok(c) => {
-                                parse_ok_count3.fetch_add(1, Ordering::Relaxed);
-                                c
-                            }
-                            Err(_) => {
-                                parse_err_count3.fetch_add(1, Ordering::Relaxed);
-                                Cell::new((0, 0), Data::Empty)
-                            }
-                        };
+                        let cell = parse_cell_fragment(&raw, seq)
+                            .unwrap_or_else(|_| Cell::new((0, 0), Data::Empty));
                         batch.push((seq, cell));
                     }
-                    result_send_count3.fetch_add(batch.len(), Ordering::Relaxed);
                     if result_tx2.send(batch).is_err() {
                         break;
                     }
@@ -787,20 +754,6 @@ mod tests {
             t_read.elapsed().as_secs_f64(),
             count
         );
-
-        let scan_n = scan_count.load(Ordering::Relaxed);
-        let task_send_n = task_send_count.load(Ordering::Relaxed);
-        let parse_ok_n = parse_ok_count.load(Ordering::Relaxed);
-        let parse_err_n = parse_err_count.load(Ordering::Relaxed);
-        let result_send_n = result_send_count.load(Ordering::Relaxed);
-        eprintln!("--- Pipeline counters ---");
-        eprintln!("scan found       : {}", scan_n);
-        eprintln!("task_tx sent     : {}", task_send_n);
-        eprintln!("parse ok         : {}", parse_ok_n);
-        eprintln!("parse err/empty  : {}", parse_err_n);
-        eprintln!("result_tx sent   : {}", result_send_n);
-        eprintln!("consumed         : {}", count);
-        eprintln!("expected         : 59500954");
 
         eprintln!("{}", sep);
     }

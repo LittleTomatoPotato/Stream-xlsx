@@ -262,6 +262,7 @@ fn scan_cell_boundaries(xml: &[u8]) -> Vec<(u32, u32)> {
                 continue;
             }
 
+            let mut found_close = false;
             while j + 3 < xml_len {
                 if xml[j] == b'<'
                     && xml[j + 1] == b'/'
@@ -269,11 +270,14 @@ fn scan_cell_boundaries(xml: &[u8]) -> Vec<(u32, u32)> {
                     && xml[j + 3] == b'>'
                 {
                     j += 4;
+                    found_close = true;
                     break;
                 }
                 j += 1;
             }
-            boundaries.push((c_start, j as u32));
+            if found_close {
+                boundaries.push((c_start, j as u32));
+            }
             i = j;
         } else {
             i += 1;
@@ -440,5 +444,386 @@ mod tests {
 
         eprintln!("{}", sep);
     }
+
+    // ------------------------------------------------------------------
+    // Streaming prototype: decompress + scan + dispatch in one thread,
+    // send cell-fragment copies to workers.  Lower peak memory.
+    // ------------------------------------------------------------------
+    #[test]
+    fn profile_sheet_fast_streaming() {
+        let path = Path::new(TEST_FILE);
+        if !path.exists() {
+            eprintln!("Skip: {} not found", path.display());
+            return;
+        }
+
+        let sep: String = std::iter::repeat('=').take(60).collect();
+        eprintln!("\n{}", sep);
+        eprintln!("SheetFastReader STREAMING prototype (batch CHUNK_SIZE={})", CHUNK_SIZE);
+        eprintln!("Baseline reference: 14.4s  [cells=59500954]");
+        eprintln!("{}", sep);
+
+        let t_total = Instant::now();
+
+        let workbook = crate::workbook::XlsxWorkbook::open_fast(path).unwrap();
+        workbook.init().unwrap();
+        let sheet_path = workbook
+            .sheet_path_by_idx(0)
+            .ok_or_else(|| anyhow!("sheet 0 not found"))
+            .unwrap()
+            .to_string();
+
+
+        let (task_tx, task_rx) = bounded(QUEUE_CAP);
+        let (result_tx, result_rx) = bounded(QUEUE_CAP);
+
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let scan_count = Arc::new(AtomicUsize::new(0));
+        let task_send_count = Arc::new(AtomicUsize::new(0));
+        let parse_ok_count = Arc::new(AtomicUsize::new(0));
+        let parse_err_count = Arc::new(AtomicUsize::new(0));
+        let result_send_count = Arc::new(AtomicUsize::new(0));
+        let consume_count = Arc::new(AtomicUsize::new(0));
+
+        let scan_count2 = Arc::clone(&scan_count);
+        let task_send_count2 = Arc::clone(&task_send_count);
+
+        // 解压 + 扫描 + 分发线程（单线程，边读边扫）
+        let path2 = path.to_path_buf();
+        std::thread::spawn(move || {
+            let file = std::fs::File::open(&path2).unwrap();
+            let reader = std::io::BufReader::with_capacity(1024 * 1024, file);
+            let mut archive = zip::ZipArchive::new(reader).unwrap();
+            let mut f = archive.by_name(&sheet_path).unwrap();
+            let mut accumulate = Vec::with_capacity(2 * 1024 * 1024);
+            let mut temp = vec![0u8; 1024 * 1024];
+            let mut seq = 0usize;
+            let mut chunk = Vec::with_capacity(CHUNK_SIZE);
+            let mut truncated = true; // 第一次循环从 0 开始扫描
+
+            loop {
+                let n = f.read(&mut temp).unwrap();
+                if n == 0 {
+                    break;
+                }
+
+                let prev_len = accumulate.len();
+                accumulate.extend_from_slice(&temp[..n]);
+                let mut i = if truncated || prev_len < 3 {
+                    0
+                } else {
+                    prev_len.saturating_sub(3)
+                };
+                truncated = false;
+
+                while i + 2 < accumulate.len() {
+                    if accumulate[i] == b'<'
+                        && accumulate[i + 1] == b'c'
+                        && (accumulate[i + 2] == b' ' || accumulate[i + 2] == b'>')
+                    {
+                        let c_start = i;
+                        let mut j = i + 2;
+                        let mut self_closing = false;
+
+                        while j + 1 < accumulate.len() {
+                            if accumulate[j] == b'/' && accumulate[j + 1] == b'>' {
+                                self_closing = true;
+                                j += 2;
+                                break;
+                            }
+                            if accumulate[j] == b'>' {
+                                j += 1;
+                                break;
+                            }
+                            j += 1;
+                        }
+
+                        if self_closing {
+                            chunk.push((seq, accumulate[c_start..j].to_vec()));
+                            scan_count2.fetch_add(1, Ordering::Relaxed);
+                            seq += 1;
+                            i = j;
+                            if chunk.len() >= CHUNK_SIZE {
+                                task_send_count2.fetch_add(chunk.len(), Ordering::Relaxed);
+                                let old = std::mem::replace(
+                                    &mut chunk,
+                                    Vec::with_capacity(CHUNK_SIZE),
+                                );
+                                if task_tx.send(old).is_err() {
+                                    return;
+                                }
+                            }
+                            continue;
+                        }
+
+                        if j >= accumulate.len() {
+                            break;
+                        }
+
+                        let mut found_close = false;
+                        while j + 3 < accumulate.len() {
+                            if accumulate[j] == b'<'
+                                && accumulate[j + 1] == b'/'
+                                && accumulate[j + 2] == b'c'
+                                && accumulate[j + 3] == b'>'
+                            {
+                                j += 4;
+                                found_close = true;
+                                break;
+                            }
+                            j += 1;
+                        }
+
+                        if !found_close {
+                            break;
+                        }
+
+                        chunk.push((seq, accumulate[c_start..j].to_vec()));
+                        scan_count2.fetch_add(1, Ordering::Relaxed);
+                        seq += 1;
+                        i = j;
+                        if chunk.len() >= CHUNK_SIZE {
+                            task_send_count2.fetch_add(chunk.len(), Ordering::Relaxed);
+                            let old =
+                                std::mem::replace(&mut chunk, Vec::with_capacity(CHUNK_SIZE));
+                            if task_tx.send(old).is_err() {
+                                return;
+                            }
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+
+                // 截断：以最后一个完整的 </c> 或 /> 为界，确保标签不被拆开
+                if let Some(end) = last_complete_cell_end(&accumulate[..i]) {
+                    let remaining = accumulate.split_off(end);
+                    accumulate = remaining;
+                    truncated = true;
+                }
+            }
+
+            // 最终扫描：read 返回 0 后处理剩余数据
+            let mut i = 0;
+            while i + 2 < accumulate.len() {
+                if accumulate[i] == b'<'
+                    && accumulate[i + 1] == b'c'
+                    && (accumulate[i + 2] == b' ' || accumulate[i + 2] == b'>')
+                {
+                    let c_start = i;
+                    let mut j = i + 2;
+                    let mut self_closing = false;
+
+                    while j + 1 < accumulate.len() {
+                        if accumulate[j] == b'/' && accumulate[j + 1] == b'>' {
+                            self_closing = true;
+                            j += 2;
+                            break;
+                        }
+                        if accumulate[j] == b'>' {
+                            j += 1;
+                            break;
+                        }
+                        j += 1;
+                    }
+
+                    if self_closing {
+                        chunk.push((seq, accumulate[c_start..j].to_vec()));
+                        scan_count2.fetch_add(1, Ordering::Relaxed);
+                        seq += 1;
+                        i = j;
+                        if chunk.len() >= CHUNK_SIZE {
+                            task_send_count2.fetch_add(chunk.len(), Ordering::Relaxed);
+                            let old = std::mem::replace(&mut chunk, Vec::with_capacity(CHUNK_SIZE));
+                            if task_tx.send(old).is_err() { return; }
+                        }
+                        continue;
+                    }
+
+                    if j >= accumulate.len() { break; }
+
+                    let mut found_close = false;
+                    while j + 3 < accumulate.len() {
+                        if accumulate[j] == b'<'
+                            && accumulate[j + 1] == b'/'
+                            && accumulate[j + 2] == b'c'
+                            && accumulate[j + 3] == b'>'
+                        {
+                            j += 4;
+                            found_close = true;
+                            break;
+                        }
+                        j += 1;
+                    }
+
+                    if !found_close { break; }
+
+                    chunk.push((seq, accumulate[c_start..j].to_vec()));
+                    scan_count2.fetch_add(1, Ordering::Relaxed);
+                    seq += 1;
+                    i = j;
+                    if chunk.len() >= CHUNK_SIZE {
+                        task_send_count2.fetch_add(chunk.len(), Ordering::Relaxed);
+                        let old = std::mem::replace(&mut chunk, Vec::with_capacity(CHUNK_SIZE));
+                        if task_tx.send(old).is_err() { return; }
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+
+            if !chunk.is_empty() {
+                task_send_count2.fetch_add(chunk.len(), Ordering::Relaxed);
+                let _ = task_tx.send(chunk);
+            }
+        });
+
+        // 工作线程（N 个）：解析 cell fragment 拷贝
+        let parse_ok_count2 = Arc::clone(&parse_ok_count);
+        let parse_err_count2 = Arc::clone(&parse_err_count);
+        let result_send_count2 = Arc::clone(&result_send_count);
+        for _ in 0..PARALLELISM {
+            let task_rx2 = task_rx.clone();
+            let result_tx2 = result_tx.clone();
+            let parse_ok_count3 = Arc::clone(&parse_ok_count2);
+            let parse_err_count3 = Arc::clone(&parse_err_count2);
+            let result_send_count3 = Arc::clone(&result_send_count2);
+            std::thread::spawn(move || {
+                while let Ok(chunk) = task_rx2.recv() {
+                    let mut batch = Vec::with_capacity(chunk.len());
+                    for (seq, raw) in chunk {
+                        let cell = match parse_cell_fragment(&raw, seq) {
+                            Ok(c) => {
+                                parse_ok_count3.fetch_add(1, Ordering::Relaxed);
+                                c
+                            }
+                            Err(_) => {
+                                parse_err_count3.fetch_add(1, Ordering::Relaxed);
+                                Cell::new((0, 0), Data::Empty)
+                            }
+                        };
+                        batch.push((seq, cell));
+                    }
+                    result_send_count3.fetch_add(batch.len(), Ordering::Relaxed);
+                    if result_tx2.send(batch).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(task_rx);
+        drop(result_tx);
+
+        let new_elapsed = t_total.elapsed().as_secs_f64();
+        eprintln!(
+            "C. Streaming::new()                : {:.3}s  (includes unzip+scan+dispatch start)",
+            new_elapsed
+        );
+
+        let t_read = Instant::now();
+        let mut count = 0usize;
+        let mut next_expected = 0usize;
+        let mut buffer = HashMap::new();
+        let mut pending = Vec::new();
+        let mut pending_idx = 0;
+        let mut pipe_closed = false;
+
+        loop {
+            // 优先从 pending batch 顺序消费
+            if pending_idx < pending.len() {
+                let (seq, _) = pending[pending_idx];
+                if seq == next_expected {
+                    pending_idx += 1;
+                    next_expected += 1;
+                    count += 1;
+                    continue;
+                }
+                pending.clear();
+                pending_idx = 0;
+            }
+
+            // 检查排序缓冲
+            if let Some(_) = buffer.remove(&next_expected) {
+                next_expected += 1;
+                count += 1;
+                continue;
+            }
+
+            if pipe_closed && buffer.is_empty() {
+                break;
+            }
+
+            // 从结果管道 recv batch
+            match result_rx.recv() {
+                Ok(batch) => {
+                    if batch.is_empty() {
+                        continue;
+                    }
+                    if batch[0].0 == next_expected {
+                        pending = batch;
+                        pending_idx = 1;
+                        next_expected += 1;
+                        count += 1;
+                        continue;
+                    }
+                    for (seq, cell) in batch {
+                        buffer.insert(seq, cell);
+                    }
+                    if let Some(_) = buffer.remove(&next_expected) {
+                        next_expected += 1;
+                        count += 1;
+                        continue;
+                    }
+                }
+                Err(_) => {
+                    pipe_closed = true;
+                    continue;
+                }
+            }
+        }
+
+        eprintln!(
+            "C. Streaming (concurrent)        : {:.3}s  [cells={}]",
+            t_read.elapsed().as_secs_f64(),
+            count
+        );
+
+        let scan_n = scan_count.load(Ordering::Relaxed);
+        let task_send_n = task_send_count.load(Ordering::Relaxed);
+        let parse_ok_n = parse_ok_count.load(Ordering::Relaxed);
+        let parse_err_n = parse_err_count.load(Ordering::Relaxed);
+        let result_send_n = result_send_count.load(Ordering::Relaxed);
+        eprintln!("--- Pipeline counters ---");
+        eprintln!("scan found       : {}", scan_n);
+        eprintln!("task_tx sent     : {}", task_send_n);
+        eprintln!("parse ok         : {}", parse_ok_n);
+        eprintln!("parse err/empty  : {}", parse_err_n);
+        eprintln!("result_tx sent   : {}", result_send_n);
+        eprintln!("consumed         : {}", count);
+        eprintln!("expected         : 59500954");
+
+        eprintln!("{}", sep);
+    }
+}
+
+/// 找到 data 中最后一个完整的 cell 结束位置（</c> 或 <c .../>）。
+/// 用于流式扫描的安全截断，确保不会拆开标签。
+fn last_complete_cell_end(data: &[u8]) -> Option<usize> {
+    for pos in (0..data.len()).rev() {
+        if data[pos] == b'>' {
+            if pos >= 3 && &data[pos - 3..=pos] == b"</c>" {
+                return Some(pos + 1);
+            }
+            if pos >= 1 && &data[pos - 1..=pos] == b"/>" {
+                // 往前找 <c，确认是 cell 的自关闭标签
+                if let Some(lt) = data[..pos].iter().rposition(|&b| b == b'<') {
+                    if lt + 1 < data.len() && data[lt + 1] == b'c' {
+                        return Some(pos + 1);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 

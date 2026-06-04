@@ -3,6 +3,7 @@ use pyo3_polars::PyDataFrame;
 use std::sync::Arc;
 use stream_xlsx::df_iter::DataFrameIter;
 use stream_xlsx::workbook::XlsxWorkbook;
+use stream_xlsx::FastConfig;
 
 /// Python 可迭代的流式 xlsx 读取器
 ///
@@ -68,6 +69,8 @@ impl XlsxReader {
 /// - sheet_name: 工作表名称（可选）
 /// - sheet_idx: 工作表索引（可选，0-based）
 /// - has_header: 是否将第一行作为表头，默认 True
+/// - fast: 是否使用 fast 模式（并发解析），默认 False
+/// - fast_parallelism: fast 模式 worker 线程数（可选，默认自动）
 ///
 /// 用法:
 /// ```python
@@ -80,7 +83,7 @@ impl XlsxReader {
 ///     print(df.shape)
 /// ```
 #[pyfunction]
-#[pyo3(signature = (path, batch_size=10000, sheet_name=None, sheet_idx=None, has_header=true, skip_rows=None))]
+#[pyo3(signature = (path, batch_size=10000, sheet_name=None, sheet_idx=None, has_header=true, skip_rows=None, fast=false, fast_parallelism=None))]
 fn read_xlsx(
     path: &str,
     batch_size: Option<usize>,
@@ -88,13 +91,37 @@ fn read_xlsx(
     sheet_idx: Option<usize>,
     has_header: bool,
     skip_rows: Option<Vec<u32>>,
+    fast: bool,
+    fast_parallelism: Option<usize>,
 ) -> PyResult<XlsxReader> {
     let workbook = Arc::new(
-        XlsxWorkbook::open(path)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?,
+        if fast {
+            XlsxWorkbook::open_fast(path)
+        } else {
+            XlsxWorkbook::open(path)
+        }
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?,
     );
     let sheet_name_ref = sheet_name.as_deref();
     let skip_rows_ref = skip_rows.as_deref();
+
+    let config = if fast {
+        let mut cfg = FastConfig::default();
+        if let Some(v) = fast_parallelism {
+            let cores = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(8);
+            cfg.parallelism = if v > cores {
+                cores.saturating_sub(2)
+            } else {
+                v
+            };
+        }
+        Some(cfg)
+    } else {
+        None
+    };
+
     let iter = DataFrameIter::from_workbook(
         batch_size,
         Arc::clone(&workbook),
@@ -102,6 +129,8 @@ fn read_xlsx(
         sheet_idx,
         has_header,
         skip_rows_ref,
+        fast,
+        config,
     )
     .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?;
     Ok(XlsxReader {

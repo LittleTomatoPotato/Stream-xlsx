@@ -92,7 +92,7 @@ pub fn test_parttern(
     }
 
     let df_iter = if args.fast {
-        match stream_xlsx::df_iter::df_iter_fast(args.batch_size, path, None, 0.into(), true, None) {
+        match stream_xlsx::df_iter::df_iter_fast(args.batch_size, path, None, 0.into(), true, None, Some(crate::build_fast_config(args))) {
             Ok(a) => a,
             Err(e) => {
                 println!("文件打开错误: {}, 输入路径:{:?}", e, path);

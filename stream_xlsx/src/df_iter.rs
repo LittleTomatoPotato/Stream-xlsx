@@ -649,6 +649,7 @@ impl DataFrameIter {
         has_header: bool,
         skip_rows: Option<&[u32]>,
         fast: bool,
+        config: Option<crate::sheet_fast::FastConfig>,
     ) -> anyhow::Result<Self>
     where
         P: AsRef<Path>,
@@ -658,7 +659,7 @@ impl DataFrameIter {
         } else {
             Arc::new(XlsxWorkbook::open(path)?)
         };
-        Self::from_workbook(batch_size, workbook, sheet_name, sheet_idx, has_header, skip_rows, fast)
+        Self::from_workbook(batch_size, workbook, sheet_name, sheet_idx, has_header, skip_rows, fast, config)
     }
 
     pub fn from_workbook(
@@ -669,10 +670,12 @@ impl DataFrameIter {
         has_header: bool,
         skip_rows: Option<&[u32]>,
         fast: bool,
+        config: Option<crate::sheet_fast::FastConfig>,
     ) -> anyhow::Result<Self> {
+        let cfg_ref = config.as_ref();
         let reader = if fast {
             SheetReader::Fast(SheetFastReader::new(
-                workbook.path(), sheet_name, sheet_idx,
+                workbook.path(), sheet_name, sheet_idx, cfg_ref,
             )?)
         } else {
             SheetReader::Stream(XlsxStreamReader::from_workbook(
@@ -720,9 +723,10 @@ impl DataFrameIter {
         sheet_name: Option<&str>,
         sheet_idx: Option<usize>,
     ) -> anyhow::Result<()> {
+        let default_cfg = crate::sheet_fast::FastConfig::default();
         self.reader = if self.fast {
             SheetReader::Fast(SheetFastReader::new(
-                self.workbook.path(), sheet_name, sheet_idx,
+                self.workbook.path(), sheet_name, sheet_idx, Some(&default_cfg),
             )?)
         } else {
             SheetReader::Stream(XlsxStreamReader::from_workbook(
@@ -933,7 +937,7 @@ pub fn df_iter(
     has_header: bool,
     skip_rows: Option<&[u32]>,
 ) -> anyhow::Result<DataFrameIter> {
-    DataFrameIter::new(batch_size, path, sheet_name, sheet_idx, has_header, skip_rows, false)
+    DataFrameIter::new(batch_size, path, sheet_name, sheet_idx, has_header, skip_rows, false, None)
 }
 
 /// Fast mode: fully decompress sharedStrings.xml then byte-scan.
@@ -945,8 +949,9 @@ pub fn df_iter_fast(
     sheet_idx: Option<usize>,
     has_header: bool,
     skip_rows: Option<&[u32]>,
+    config: Option<crate::sheet_fast::FastConfig>,
 ) -> anyhow::Result<DataFrameIter> {
-    DataFrameIter::new(batch_size, path, sheet_name, sheet_idx, has_header, skip_rows, true)
+    DataFrameIter::new(batch_size, path, sheet_name, sheet_idx, has_header, skip_rows, true, config)
 }
 
 #[cfg(test)]

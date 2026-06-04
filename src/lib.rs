@@ -9,6 +9,33 @@ use clap::{Parser, Subcommand};
 pub use stream_xlsx;
 use stream_xlsx::df_iter::df_iter;
 
+pub fn build_fast_config(args: &Args) -> stream_xlsx::FastConfig {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
+    let mut cfg = stream_xlsx::FastConfig::default();
+    if let Some(v) = args.fast_parallelism {
+        cfg.parallelism = if v > cores {
+            cores.saturating_sub(2)
+        } else {
+            v
+        };
+    }
+    if let Some(v) = args.fast_chunk_size {
+        cfg.chunk_size = v;
+    }
+    if let Some(v) = args.fast_queue_cap {
+        cfg.queue_cap_mul = v;
+    }
+    if let Some(v) = args.fast_temp_kb {
+        cfg.temp_size = v * 1024;
+    }
+    if let Some(v) = args.fast_buf_kb {
+        cfg.buf_size = v * 1024;
+    }
+    cfg
+}
+
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
 pub struct Args {
@@ -38,6 +65,21 @@ pub struct Args {
     /// Trades ~2-4GB extra peak memory for ~1.5x faster init().
     #[arg(long, global = true)]
     pub fast: bool,
+    /// Fast mode: parsing worker threads
+    #[arg(long, global = true, value_name = "N")]
+    pub fast_parallelism: Option<usize>,
+    /// Fast mode: cells per chunk
+    #[arg(long, global = true, value_name = "N")]
+    pub fast_chunk_size: Option<usize>,
+    /// Fast mode: queue capacity multiplier (queue = threads * mul + 1)
+    #[arg(long, global = true, value_name = "MUL")]
+    pub fast_queue_cap: Option<usize>,
+    /// Fast mode: read temp buffer size (KB)
+    #[arg(long, global = true, value_name = "KB")]
+    pub fast_temp_kb: Option<usize>,
+    /// Fast mode: BufReader size (KB)
+    #[arg(long, global = true, value_name = "KB")]
+    pub fast_buf_kb: Option<usize>,
 }
 
 #[derive(Debug, Subcommand)]

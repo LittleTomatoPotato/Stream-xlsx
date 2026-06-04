@@ -26,6 +26,7 @@ fn get_iter(
             Some(*sheet_idx),
             true,
             None,
+            Some(crate::build_fast_config(args)),
         )?)
     } else {
         Box::new(df_iter(

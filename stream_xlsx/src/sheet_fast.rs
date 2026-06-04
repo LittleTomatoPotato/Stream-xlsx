@@ -10,12 +10,46 @@ use std::io::{BufReader, Read};
 use std::path::Path;
 use std::sync::Arc;
 
-/// 并发解析线程数
-const PARALLELISM: usize = 8;
-/// 管道容量 = 并发数 + 1（固定容量，天然背压）
-const QUEUE_CAP: usize = PARALLELISM + 1;
-/// 每个 chunk 包含的 cell 数，批量处理以减少管道往返
-const CHUNK_SIZE: usize = 1000;
+/// Fast mode 运行时配置
+#[derive(Clone, Debug)]
+pub struct FastConfig {
+    /// 并发解析线程数
+    pub parallelism: usize,
+    /// 每个 chunk 包含的 cell 数，批量处理以减少管道往返
+    pub chunk_size: usize,
+    /// 管道容量倍数：实际容量 = parallelism * mul + 1
+    pub queue_cap_mul: usize,
+    /// 应用层读取缓冲区大小（字节）
+    pub temp_size: usize,
+    /// BufReader 缓冲区大小（字节）
+    pub buf_size: usize,
+}
+
+impl FastConfig {
+    pub fn queue_cap(&self) -> usize {
+        self.parallelism.saturating_mul(self.queue_cap_mul).saturating_add(1)
+    }
+
+    /// 运行时默认值：parallelism = min(8, cores / 2)
+    pub fn with_defaults() -> Self {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8);
+        Self {
+            parallelism: (cores / 2).min(8),
+            chunk_size: 1000,
+            queue_cap_mul: 1,
+            temp_size: 1024 * 1024,
+            buf_size: 1024 * 1024,
+        }
+    }
+}
+
+impl Default for FastConfig {
+    fn default() -> Self {
+        Self::with_defaults()
+    }
+}
 
 // ------------------------------------------------------------------
 // SheetFastReader: 对外 API
@@ -35,7 +69,14 @@ pub struct SheetFastReader {
 
 impl SheetFastReader {
     /// Open a sheet and start background parsing (streaming: unzip + scan on the fly).
-    pub fn new(path: &Path, sheet_name: Option<&str>, sheet_idx: Option<usize>) -> Result<Self> {
+    pub fn new(
+        path: &Path,
+        sheet_name: Option<&str>,
+        sheet_idx: Option<usize>,
+        config: Option<&FastConfig>,
+    ) -> Result<Self> {
+        let default_cfg = FastConfig::default();
+        let config = config.unwrap_or(&default_cfg);
         let workbook = crate::workbook::XlsxWorkbook::open_fast(path)?;
         workbook.init()?;
         let sheet_path = match (sheet_name, sheet_idx) {
@@ -56,7 +97,7 @@ impl SheetFastReader {
         // 1. 快速读取 XML 头部解析 dimensions（不需要完整解压）
         let dimensions = {
             let file = std::fs::File::open(path)?;
-            let reader = BufReader::with_capacity(1024 * 1024, file);
+            let reader = BufReader::with_capacity(config.buf_size, file);
             let mut archive = zip::ZipArchive::new(reader)?;
             let mut f = archive.by_name(&sheet_path)?;
             let mut head = vec![0u8; 8192];
@@ -65,22 +106,28 @@ impl SheetFastReader {
         };
         let strings = Arc::clone(workbook.strings().unwrap());
 
-        let (task_tx, task_rx) = bounded(QUEUE_CAP);
-        let (result_tx, result_rx) = bounded(QUEUE_CAP);
+        let queue_cap = config.queue_cap();
+        let (task_tx, task_rx) = bounded(queue_cap);
+        let (result_tx, result_rx) = bounded(queue_cap);
         let mut handles = Vec::new();
+
+        let parallelism = config.parallelism;
+        let chunk_size = config.chunk_size;
+        let temp_size = config.temp_size;
+        let buf_size = config.buf_size;
 
         // 2. 解压 + 扫描 + dispatch 线程（单线程，边读边扫）
         let path2 = path.to_path_buf();
         let sheet_path2 = sheet_path.clone();
         handles.push(std::thread::spawn(move || {
             let file = std::fs::File::open(&path2).unwrap();
-            let reader = BufReader::with_capacity(1024 * 1024, file);
+            let reader = BufReader::with_capacity(buf_size, file);
             let mut archive = zip::ZipArchive::new(reader).unwrap();
             let mut f = archive.by_name(&sheet_path2).unwrap();
             let mut accumulate = BytesMut::with_capacity(8 * 1024 * 1024);
-            let mut temp = vec![0u8; 1024 * 1024];
+            let mut temp = vec![0u8; temp_size];
             let mut seq = 0usize;
-            let mut chunk: Vec<(usize, Bytes)> = Vec::with_capacity(CHUNK_SIZE);
+            let mut chunk: Vec<(usize, Bytes)> = Vec::with_capacity(chunk_size);
 
             loop {
                 let n = f.read(&mut temp).unwrap();
@@ -122,10 +169,10 @@ impl SheetFastReader {
                             chunk.push((seq, cell));
                             seq += 1;
                             i = 0;
-                            if chunk.len() >= CHUNK_SIZE {
+                            if chunk.len() >= chunk_size {
                                 let old = std::mem::replace(
                                     &mut chunk,
-                                    Vec::with_capacity(CHUNK_SIZE),
+                                    Vec::with_capacity(chunk_size),
                                 );
                                 if task_tx.send(old).is_err() {
                                     return;
@@ -164,9 +211,9 @@ impl SheetFastReader {
                         chunk.push((seq, cell));
                         seq += 1;
                         i = 0;
-                        if chunk.len() >= CHUNK_SIZE {
+                        if chunk.len() >= chunk_size {
                             let old =
-                                std::mem::replace(&mut chunk, Vec::with_capacity(CHUNK_SIZE));
+                                std::mem::replace(&mut chunk, Vec::with_capacity(chunk_size));
                             if task_tx.send(old).is_err() {
                                 return;
                             }
@@ -215,8 +262,8 @@ impl SheetFastReader {
                         chunk.push((seq, cell));
                         seq += 1;
                         i = 0;
-                        if chunk.len() >= CHUNK_SIZE {
-                            let old = std::mem::replace(&mut chunk, Vec::with_capacity(CHUNK_SIZE));
+                        if chunk.len() >= chunk_size {
+                            let old = std::mem::replace(&mut chunk, Vec::with_capacity(chunk_size));
                             if task_tx.send(old).is_err() { return; }
                         }
                         continue;
@@ -248,8 +295,8 @@ impl SheetFastReader {
                     chunk.push((seq, cell));
                     seq += 1;
                     i = 0;
-                    if chunk.len() >= CHUNK_SIZE {
-                        let old = std::mem::replace(&mut chunk, Vec::with_capacity(CHUNK_SIZE));
+                    if chunk.len() >= chunk_size {
+                        let old = std::mem::replace(&mut chunk, Vec::with_capacity(chunk_size));
                         if task_tx.send(old).is_err() { return; }
                     }
                 } else {
@@ -263,7 +310,7 @@ impl SheetFastReader {
         }));
 
         // 3. 工作线程（N 个）：解析 cell fragment
-        for _ in 0..PARALLELISM {
+        for _ in 0..parallelism {
             let task_rx2 = task_rx.clone();
             let result_tx2 = result_tx.clone();
             handles.push(std::thread::spawn(move || {
@@ -392,61 +439,6 @@ fn parse_dimensions(xml: &[u8]) -> Result<Dimensions> {
         }
     }
     Ok(Dimensions::default())
-}
-
-fn scan_cell_boundaries(xml: &[u8]) -> Vec<(u32, u32)> {
-    let mut boundaries = Vec::with_capacity(xml.len() / 200);
-    let mut i = 0usize;
-    let xml_len = xml.len();
-
-    while i + 2 < xml_len {
-        if xml[i] == b'<' && xml[i + 1] == b'c' && (xml[i + 2] == b' ' || xml[i + 2] == b'>') {
-            let c_start = i as u32;
-            let mut j = i + 2;
-            let mut self_closing = false;
-
-            while j + 1 < xml_len {
-                if xml[j] == b'/' && xml[j + 1] == b'>' {
-                    self_closing = true;
-                    j += 2;
-                    break;
-                }
-                if xml[j] == b'>' {
-                    j += 1;
-                    break;
-                }
-                j += 1;
-            }
-
-            if self_closing {
-                boundaries.push((c_start, j as u32));
-                i = j;
-                continue;
-            }
-
-            let mut found_close = false;
-            while j + 3 < xml_len {
-                if xml[j] == b'<'
-                    && xml[j + 1] == b'/'
-                    && xml[j + 2] == b'c'
-                    && xml[j + 3] == b'>'
-                {
-                    j += 4;
-                    found_close = true;
-                    break;
-                }
-                j += 1;
-            }
-            if found_close {
-                boundaries.push((c_start, j as u32));
-            }
-            i = j;
-        } else {
-            i += 1;
-        }
-    }
-
-    boundaries
 }
 
 // ------------------------------------------------------------------
@@ -579,13 +571,13 @@ mod tests {
 
         let sep: String = std::iter::repeat('=').take(60).collect();
         eprintln!("\n{}", sep);
-        eprintln!("SheetFastReader prototype validation (batch CHUNK_SIZE={})", CHUNK_SIZE);
+        eprintln!("SheetFastReader prototype validation (batch CHUNK_SIZE={})", FastConfig::default().chunk_size);
         eprintln!("Baseline reference: 14.4s  [cells=59500954]");
         eprintln!("{}", sep);
 
         {
             let t_new = Instant::now();
-            let mut reader = SheetFastReader::new(path, None, Some(0)).unwrap();
+            let mut reader = SheetFastReader::new(path, None, Some(0), &FastConfig::default()).unwrap();
             let new_elapsed = t_new.elapsed().as_secs_f64();
             eprintln!(
                 "B. SheetFastReader::new()          : {:.3}s  (includes unzip+scan+dispatch start)",
@@ -617,13 +609,13 @@ mod tests {
 
         let sep: String = std::iter::repeat('=').take(60).collect();
         eprintln!("\n{}", sep);
-        eprintln!("SheetFastReader STREAMING (zero-copy)  [CHUNK_SIZE={}]", CHUNK_SIZE);
+        eprintln!("SheetFastReader STREAMING (zero-copy)  [CHUNK_SIZE={}]", FastConfig::default().chunk_size);
         eprintln!("Baseline reference: 14.4s  [cells=59500954]");
         eprintln!("{}", sep);
 
         {
             let t_new = Instant::now();
-            let mut reader = SheetFastReader::new(path, None, Some(0)).unwrap();
+            let mut reader = SheetFastReader::new(path, None, Some(0), &FastConfig::default()).unwrap();
             let new_elapsed = t_new.elapsed().as_secs_f64();
             eprintln!(
                 "C. Streaming::new()                : {:.3}s  (includes unzip+scan+dispatch start)",

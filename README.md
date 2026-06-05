@@ -6,7 +6,7 @@
 
 - **两种解析模式**:
   - **default 模式** — 单线程流式,内存最低(~2 GB,适合超大数据集)
-  - **fast 模式** (`--fast`) — 8 worker 并发解析,速度 **~3x** faster(~4.8s vs ~15s)
+  - **fast 模式** (`--fast`) — `min(8, cores/2)` worker 并发解析,速度 **~3x** faster(~4.8s vs ~15s)
 - **流式产出**:逐 batch 产出 Polars DataFrame,100 万行 × 60 列(~660 MB)默认模式 ~15s,fast 模式 ~4.8s
 - **多 sheet 支持**:打开后可查看所有 sheet 名称,按需切换,sharedStrings/styles 只解析一次
 - **惰性加载**:`open()` 仅解析 sheet 列表;`sharedStrings.xml` / `styles.xml` 在首次读取时才加载
@@ -154,8 +154,8 @@ for df in reader:
 | stream_xlsx_py fast (bs=1000000) | 5.73 s | 3,599 MB | fast + 全量 |
 | stream_xlsx_py (bs=10000) | 14.48 s | 2,068 MB | default + 流式 |
 | stream_xlsx_py (bs=50000) | 14.40 s | 2,143 MB | default + 流式 |
-| stream_xlsx_py (bs=100000) | 14.59 s | 2,907 MB | default + 流式 |
-| stream_xlsx_py (bs=1000000) | 14.57 s | 3,586 MB | default + 全量 |
+| stream_xlsx_py (bs=100000) | 14.59 s | 2,907 MB ⚠ | default + 流式 |
+| stream_xlsx_py (bs=1000000) | 14.57 s | 3,586 MB ⚠ | default + 全量 |
 | polars + calamine | 23.50 s | 11,109 MB | `pl.read_excel(engine="calamine")` |
 | polars + xlsx2csv | 92.64 s | 10,902 MB | `pl.read_excel(engine="xlsx2csv")` |
 
@@ -167,6 +167,10 @@ for df in reader:
 - 内存曲线(注意 polars 峰值 11 GB vs stream_xlsx_py 稳定 2-3.6 GB):
 
 ![Python memory usage over time](docs/benchmark/python_memory_comparison.png)
+
+> ⚠ default 模式 bs=100000 / bs=1000000 的内存读数偏高(分别 2,907 / 3,586 MB,
+> 较历史正常水平 ~2,200 / ~3,000 MB 高出 600+ / 200+ MB),疑似单次采样的 RSS
+> 抖动/Polars 缓存预热峰值,默认推荐配置(bs=10000, 2,068 MB)未受影响。
 
 ### 推荐配置
 
@@ -201,7 +205,8 @@ TypedCols (按类型 zero-copy 存储)
 
 ### fast 模式:并发解析
 
-fast 模式在 default 模式基础上,加上 8 worker 线程并发解析单元格:
+fast 模式在 default 模式基础上,加上 `min(8, cores/2)` worker 线程并发解析单元格
+(运行时通过 `std::thread::available_parallelism()` 取核心数,8 和 `cores/2` 取较小值,可通过 `--fast-parallelism` 显式覆盖):
 
 ```
 ZIP file
@@ -214,7 +219,7 @@ crossbeam channel
    │  queue capacity = parallelism × 1 + 1 (天然背压)
    ▼
 ┌──────────┬──────────┬───── ┬──────────┐
-│ worker 1 │ worker 2 │ ... │ worker 8 │
+│ worker 1 │ worker 2 │ ... │ worker N │   (N = min(8, cores/2))
 └──────────┴──────────┴───── ┴──────────┘
    │  并发解析各 cell 字节
    ▼
@@ -271,7 +276,7 @@ main thread (按 seq 顺序重组 + 输出 DataFrame)
 
 ```bash
 # Rust 库 + CLI
-cargo build
+cargo build --release
 
 # 测试
 cargo test --workspace

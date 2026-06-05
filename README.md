@@ -148,17 +148,23 @@ for df in reader:
 
 | 方案 | 时间 | 峰值内存 | 备注 |
 |------|------|---------|------|
-| **stream_xlsx_py (bs=10000)** | **16.37 s** | **2,068 MB** | 流式,推荐配置 |
-| stream_xlsx_py (bs=50000) | 16.22 s | 2,143 MB | 流式 |
-| stream_xlsx_py (bs=100000) | 16.48 s | 2,237 MB | 流式 |
-| stream_xlsx_py (bs=1000000) | 16.35 s | 2,919 MB | 全量加载 |
-| polars + calamine | 24.66 s | 8,672 MB | `pl.read_excel(engine="calamine")` |
-| polars + xlsx2csv | 95.00 s | 9,249 MB | `pl.read_excel(engine="xlsx2csv")` |
+| **stream_xlsx_py fast (bs=10000)** | **4.77 s** | **2,746 MB** | **推荐:fast + 流式** |
+| stream_xlsx_py fast (bs=50000) | 5.09 s | 2,817 MB | fast + 流式 |
+| stream_xlsx_py fast (bs=100000) | 5.05 s | 2,907 MB | fast + 流式 |
+| stream_xlsx_py fast (bs=1000000) | 5.73 s | 3,599 MB | fast + 全量 |
+| stream_xlsx_py (bs=10000) | 14.48 s | 2,068 MB | default + 流式 |
+| stream_xlsx_py (bs=50000) | 14.40 s | 2,143 MB | default + 流式 |
+| stream_xlsx_py (bs=100000) | 14.59 s | 2,907 MB | default + 流式 |
+| stream_xlsx_py (bs=1000000) | 14.57 s | 3,586 MB | default + 全量 |
+| polars + calamine | 23.50 s | 11,109 MB | `pl.read_excel(engine="calamine")` |
+| polars + xlsx2csv | 92.64 s | 10,902 MB | `pl.read_excel(engine="xlsx2csv")` |
 
 **结论**:
-- `stream_xlsx_py` 比 `polars+calamine` **快 1.5x**,内存 **低 76%**
-- 比 `polars+xlsx2csv` **快 5.8x**,内存 **低 78%**
-- 内存曲线(注意 polars 峰值 8-9 GB vs stream_xlsx_py 稳定 2 GB):
+- **fast 模式比 default 快 ~3x**(14.5s → 4.8s),内存多 ~30% — 与 CLI 行为一致
+- `stream_xlsx_py` (default) 比 `polars+calamine` **快 1.6x**,内存 **低 81%**
+- `stream_xlsx_py fast` 比 `polars+calamine` **快 4.9x**,内存 **低 75%**
+- `stream_xlsx_py fast` 比 `polars+xlsx2csv` **快 19x**,内存 **低 75%**
+- 内存曲线(注意 polars 峰值 11 GB vs stream_xlsx_py 稳定 2-3.6 GB):
 
 ![Python memory usage over time](docs/benchmark/python_memory_comparison.png)
 
@@ -170,6 +176,7 @@ for df in reader:
 | 通用大文件、追求速度 | `fast` + `batch_size=10000` | ~3x faster,内存多 30% |
 | 全量加载到单个 DataFrame | `fast` + `batch_size=1000000` | 一次产出,无 batch 调度 |
 | Python 通用 | `stream_xlsx_py` 默认参数 | 已经过调优,无需额外配置 |
+| Python 性能优先 | `stream_xlsx_py` + `fast=True` | ~3x 加速,内存代价 ~30% |
 
 ## 工作原理
 

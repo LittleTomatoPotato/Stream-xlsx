@@ -76,6 +76,15 @@ print("done")
 '''
 
 
+def make_test_code_stream_xlsx_fast(batch_size: int) -> str:
+    return f'''
+import stream_xlsx_py as sx
+for df in sx.read_xlsx("{TEST_FILE}", batch_size={batch_size}, fast=True):
+    pass
+print("done")
+'''
+
+
 def make_test_code_polars(engine: str) -> str:
     return f'''
 import polars as pl
@@ -96,6 +105,19 @@ def main():
     for bs in [10_000, 50_000, 100_000, 1_000_000]:
         name = f"stream_xlsx_py batch={bs}"
         code = make_test_code_stream_xlsx(bs)
+        res = run_subprocess_test(name, code)
+        results.append(res)
+        print(
+            f"    {'✅' if res['returncode'] == 0 else '❌'} {name}: {res['elapsed_sec']:.2f}s  {res['peak_rss_mb']:.1f}MB"
+        )
+        if res["stderr"]:
+            print(f"       stderr: {res['stderr'][:200]}")
+
+    # 1.5 stream_xlsx_py fast 模式
+    print("\n=== stream_xlsx_py fast ===")
+    for bs in [10_000, 50_000, 100_000, 1_000_000]:
+        name = f"stream_xlsx_py fast batch={bs}"
+        code = make_test_code_stream_xlsx_fast(bs)
         res = run_subprocess_test(name, code)
         results.append(res)
         print(
@@ -127,8 +149,8 @@ def main():
     )
 
     # Save data
-    out_dir = Path("benchmark_python_plots")
-    out_dir.mkdir(exist_ok=True)
+    out_dir = Path("docs/benchmark")
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     with open("benchmark_python.json", "w") as f:
         json.dump(results, f, indent=2)

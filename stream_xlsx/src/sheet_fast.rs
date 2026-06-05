@@ -27,7 +27,9 @@ pub struct FastConfig {
 
 impl FastConfig {
     pub fn queue_cap(&self) -> usize {
-        self.parallelism.saturating_mul(self.queue_cap_mul).saturating_add(1)
+        self.parallelism
+            .saturating_mul(self.queue_cap_mul)
+            .saturating_add(1)
     }
 
     /// 运行时默认值：parallelism = min(8, cores / 2)
@@ -170,10 +172,8 @@ impl SheetFastReader {
                             seq += 1;
                             i = 0;
                             if chunk.len() >= chunk_size {
-                                let old = std::mem::replace(
-                                    &mut chunk,
-                                    Vec::with_capacity(chunk_size),
-                                );
+                                let old =
+                                    std::mem::replace(&mut chunk, Vec::with_capacity(chunk_size));
                                 if task_tx.send(old).is_err() {
                                     return;
                                 }
@@ -212,8 +212,7 @@ impl SheetFastReader {
                         seq += 1;
                         i = 0;
                         if chunk.len() >= chunk_size {
-                            let old =
-                                std::mem::replace(&mut chunk, Vec::with_capacity(chunk_size));
+                            let old = std::mem::replace(&mut chunk, Vec::with_capacity(chunk_size));
                             if task_tx.send(old).is_err() {
                                 return;
                             }
@@ -264,12 +263,16 @@ impl SheetFastReader {
                         i = 0;
                         if chunk.len() >= chunk_size {
                             let old = std::mem::replace(&mut chunk, Vec::with_capacity(chunk_size));
-                            if task_tx.send(old).is_err() { return; }
+                            if task_tx.send(old).is_err() {
+                                return;
+                            }
                         }
                         continue;
                     }
 
-                    if j >= accumulate.len() { break; }
+                    if j >= accumulate.len() {
+                        break;
+                    }
 
                     let mut found_close = false;
                     while j + 3 < accumulate.len() {
@@ -285,7 +288,9 @@ impl SheetFastReader {
                         j += 1;
                     }
 
-                    if !found_close { break; }
+                    if !found_close {
+                        break;
+                    }
 
                     if c_start > 0 {
                         let _garbage = accumulate.split_to(c_start);
@@ -297,7 +302,9 @@ impl SheetFastReader {
                     i = 0;
                     if chunk.len() >= chunk_size {
                         let old = std::mem::replace(&mut chunk, Vec::with_capacity(chunk_size));
-                        if task_tx.send(old).is_err() { return; }
+                        if task_tx.send(old).is_err() {
+                            return;
+                        }
                     }
                 } else {
                     i += 1;
@@ -389,10 +396,7 @@ impl SheetFastReader {
                 continue;
             }
             if batch[0].0 == self.next_expected {
-                let cell = std::mem::replace(
-                    &mut batch[0].1,
-                    Cell::new((0, 0), Data::Empty),
-                );
+                let cell = std::mem::replace(&mut batch[0].1, Cell::new((0, 0), Data::Empty));
                 self.pending = batch;
                 self.pending_idx = 1;
                 self.next_expected += 1;
@@ -425,7 +429,7 @@ fn parse_dimensions(xml: &[u8]) -> Result<Dimensions> {
     let dim_open = find_subsequence(xml, b"<dimension ");
     let dim_empty = find_subsequence(xml, b"<dimension");
     let start = match (dim_open, dim_empty) {
-        (Some(p), _) => p + 11, // len(b"<dimension ")
+        (Some(p), _) => p + 11,    // len(b"<dimension ")
         (None, Some(p)) => p + 10, // len(b"<dimension")
         (None, None) => return Ok(Dimensions::default()),
     };
@@ -548,7 +552,9 @@ fn extract_inline_text(raw: &[u8]) -> Option<&[u8]> {
 }
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 // ------------------------------------------------------------------
@@ -571,13 +577,17 @@ mod tests {
 
         let sep: String = std::iter::repeat('=').take(60).collect();
         eprintln!("\n{}", sep);
-        eprintln!("SheetFastReader prototype validation (batch CHUNK_SIZE={})", FastConfig::default().chunk_size);
+        eprintln!(
+            "SheetFastReader prototype validation (batch CHUNK_SIZE={})",
+            FastConfig::default().chunk_size
+        );
         eprintln!("Baseline reference: 14.4s  [cells=59500954]");
         eprintln!("{}", sep);
 
         {
             let t_new = Instant::now();
-            let mut reader = SheetFastReader::new(path, None, Some(0), &FastConfig::default()).unwrap();
+            let mut reader =
+                SheetFastReader::new(path, None, Some(0), Some(&FastConfig::default())).unwrap();
             let new_elapsed = t_new.elapsed().as_secs_f64();
             eprintln!(
                 "B. SheetFastReader::new()          : {:.3}s  (includes unzip+scan+dispatch start)",
@@ -609,13 +619,17 @@ mod tests {
 
         let sep: String = std::iter::repeat('=').take(60).collect();
         eprintln!("\n{}", sep);
-        eprintln!("SheetFastReader STREAMING (zero-copy)  [CHUNK_SIZE={}]", FastConfig::default().chunk_size);
+        eprintln!(
+            "SheetFastReader STREAMING (zero-copy)  [CHUNK_SIZE={}]",
+            FastConfig::default().chunk_size
+        );
         eprintln!("Baseline reference: 14.4s  [cells=59500954]");
         eprintln!("{}", sep);
 
         {
             let t_new = Instant::now();
-            let mut reader = SheetFastReader::new(path, None, Some(0), &FastConfig::default()).unwrap();
+            let mut reader =
+                SheetFastReader::new(path, None, Some(0), Some(&FastConfig::default())).unwrap();
             let new_elapsed = t_new.elapsed().as_secs_f64();
             eprintln!(
                 "C. Streaming::new()                : {:.3}s  (includes unzip+scan+dispatch start)",
@@ -637,4 +651,3 @@ mod tests {
         eprintln!("{}", sep);
     }
 }
-

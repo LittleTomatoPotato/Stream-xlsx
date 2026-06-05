@@ -27,13 +27,23 @@ pub enum TypedCol {
 impl TypedCol {
     pub fn new(dtype: &DataType, capacity: usize) -> Self {
         match dtype {
-            DataType::Int64 => Self::Int64(Vec::with_capacity(capacity), MutableBitmap::with_capacity(capacity)),
-            DataType::Float64 => Self::Float64(Vec::with_capacity(capacity), MutableBitmap::with_capacity(capacity)),
-            DataType::Boolean => Self::Bool(Vec::with_capacity(capacity), MutableBitmap::with_capacity(capacity)),
+            DataType::Int64 => Self::Int64(
+                Vec::with_capacity(capacity),
+                MutableBitmap::with_capacity(capacity),
+            ),
+            DataType::Float64 => Self::Float64(
+                Vec::with_capacity(capacity),
+                MutableBitmap::with_capacity(capacity),
+            ),
+            DataType::Boolean => Self::Bool(
+                Vec::with_capacity(capacity),
+                MutableBitmap::with_capacity(capacity),
+            ),
             DataType::String => Self::String(MutablePlString::with_capacity(capacity)),
-            DataType::Datetime(TimeUnit::Nanoseconds, None) => {
-                Self::DateTime(Vec::with_capacity(capacity), MutableBitmap::with_capacity(capacity))
-            }
+            DataType::Datetime(TimeUnit::Nanoseconds, None) => Self::DateTime(
+                Vec::with_capacity(capacity),
+                MutableBitmap::with_capacity(capacity),
+            ),
             _ => Self::AnyValue(Vec::with_capacity(capacity)),
         }
     }
@@ -106,12 +116,28 @@ impl TypedCol {
     /// 推入一个空值（用于稀疏补齐）
     pub fn push_null(&mut self) {
         match self {
-            Self::Int64(v, b) => { v.push(0); b.push(false); }
-            Self::Float64(v, b) => { v.push(0.0); b.push(false); }
-            Self::Bool(v, b) => { v.push(false); b.push(false); }
-            Self::String(arr) => { arr.push_null(); }
-            Self::DateTime(v, b) => { v.push(0); b.push(false); }
-            Self::AnyValue(v) => { v.push(AnyValue::Null); }
+            Self::Int64(v, b) => {
+                v.push(0);
+                b.push(false);
+            }
+            Self::Float64(v, b) => {
+                v.push(0.0);
+                b.push(false);
+            }
+            Self::Bool(v, b) => {
+                v.push(false);
+                b.push(false);
+            }
+            Self::String(arr) => {
+                arr.push_null();
+            }
+            Self::DateTime(v, b) => {
+                v.push(0);
+                b.push(false);
+            }
+            Self::AnyValue(v) => {
+                v.push(AnyValue::Null);
+            }
             Self::Empty => {}
         }
     }
@@ -122,7 +148,13 @@ impl TypedCol {
             (Self::Int64(_, _), Data::Int(_)) => true,
             (Self::Float64(_, _), Data::Float(_) | Data::Int(_)) => true,
             (Self::Bool(_, _), Data::Bool(_)) => true,
-            (Self::String(_), Data::String(_) | Data::SharedStringRef(_) | Data::DateTimeIso(_) | Data::DurationIso(_)) => true,
+            (
+                Self::String(_),
+                Data::String(_)
+                | Data::SharedStringRef(_)
+                | Data::DateTimeIso(_)
+                | Data::DurationIso(_),
+            ) => true,
             (Self::DateTime(_, _), Data::DateTime(_)) => true,
             (Self::AnyValue(_), _) => true,
             (_, Data::Empty | Data::Error(_)) => true,
@@ -139,13 +171,17 @@ impl TypedCol {
                     b.push(true);
                 }
             }
-            Self::Float64(v, b) => {
-                match data {
-                    Data::Float(val) => { v.push(val); b.push(true); }
-                    Data::Int(val) => { v.push(val as f64); b.push(true); }
-                    _ => {}
+            Self::Float64(v, b) => match data {
+                Data::Float(val) => {
+                    v.push(val);
+                    b.push(true);
                 }
-            }
+                Data::Int(val) => {
+                    v.push(val as f64);
+                    b.push(true);
+                }
+                _ => {}
+            },
             Self::Bool(v, b) => {
                 if let Data::Bool(val) = data {
                     v.push(val);
@@ -201,8 +237,10 @@ impl TypedCol {
                 if let Some((offset, len)) = strings.offsets.get(idx) {
                     let offset_usize = *offset as usize;
                     let len_usize = *len as usize;
-                    let s = std::str::from_utf8(&strings.buffer[offset_usize..offset_usize + len_usize])
-                        .unwrap_or_default();
+                    let s = std::str::from_utf8(
+                        &strings.buffer[offset_usize..offset_usize + len_usize],
+                    )
+                    .unwrap_or_default();
                     v.push(AnyValue::StringOwned(PlSmallStr::from_str(s)));
                 } else {
                     v.push(AnyValue::Null);
@@ -225,7 +263,11 @@ impl TypedCol {
             (TypedCol::Int64(vec, bitmap), DataType::String) => {
                 let mut arr = MutablePlString::with_capacity(bitmap.len());
                 for (i, v) in vec.into_iter().enumerate() {
-                    if bitmap.get(i) { arr.push_value(&v.to_string()); } else { arr.push_null(); }
+                    if bitmap.get(i) {
+                        arr.push_value(&v.to_string());
+                    } else {
+                        arr.push_null();
+                    }
                 }
                 TypedCol::String(arr)
             }
@@ -233,7 +275,11 @@ impl TypedCol {
             (TypedCol::Float64(vec, bitmap), DataType::String) => {
                 let mut arr = MutablePlString::with_capacity(bitmap.len());
                 for (i, v) in vec.into_iter().enumerate() {
-                    if bitmap.get(i) { arr.push_value(&v.to_string()); } else { arr.push_null(); }
+                    if bitmap.get(i) {
+                        arr.push_value(&v.to_string());
+                    } else {
+                        arr.push_null();
+                    }
                 }
                 TypedCol::String(arr)
             }
@@ -241,7 +287,11 @@ impl TypedCol {
             (TypedCol::Bool(vec, bitmap), DataType::String) => {
                 let mut arr = MutablePlString::with_capacity(bitmap.len());
                 for (i, v) in vec.into_iter().enumerate() {
-                    if bitmap.get(i) { arr.push_value(&v.to_string()); } else { arr.push_null(); }
+                    if bitmap.get(i) {
+                        arr.push_value(&v.to_string());
+                    } else {
+                        arr.push_null();
+                    }
                 }
                 TypedCol::String(arr)
             }
@@ -249,7 +299,11 @@ impl TypedCol {
             (TypedCol::DateTime(vec, bitmap), DataType::String) => {
                 let mut arr = MutablePlString::with_capacity(bitmap.len());
                 for (i, v) in vec.into_iter().enumerate() {
-                    if bitmap.get(i) { arr.push_value(&v.to_string()); } else { arr.push_null(); }
+                    if bitmap.get(i) {
+                        arr.push_value(&v.to_string());
+                    } else {
+                        arr.push_null();
+                    }
                 }
                 TypedCol::String(arr)
             }
@@ -260,35 +314,53 @@ impl TypedCol {
                     TypedCol::Int64(vec, bitmap) => {
                         for (i, v) in vec.drain(..).enumerate() {
                             let valid = bitmap.get(i);
-                            av_vec.push(if valid { AnyValue::Int64(v) } else { AnyValue::Null });
+                            av_vec.push(if valid {
+                                AnyValue::Int64(v)
+                            } else {
+                                AnyValue::Null
+                            });
                         }
                     }
                     TypedCol::Float64(vec, bitmap) => {
                         for (i, v) in vec.drain(..).enumerate() {
                             let valid = bitmap.get(i);
-                            av_vec.push(if valid { AnyValue::Float64(v) } else { AnyValue::Null });
+                            av_vec.push(if valid {
+                                AnyValue::Float64(v)
+                            } else {
+                                AnyValue::Null
+                            });
                         }
                     }
                     TypedCol::Bool(vec, bitmap) => {
                         for (i, v) in vec.drain(..).enumerate() {
                             let valid = bitmap.get(i);
-                            av_vec.push(if valid { AnyValue::Boolean(v) } else { AnyValue::Null });
+                            av_vec.push(if valid {
+                                AnyValue::Boolean(v)
+                            } else {
+                                AnyValue::Null
+                            });
                         }
                     }
                     TypedCol::String(arr) => {
-                        let frozen = std::mem::replace(arr, MutablePlString::with_capacity(0)).freeze();
+                        let frozen =
+                            std::mem::replace(arr, MutablePlString::with_capacity(0)).freeze();
                         for i in 0..frozen.len() {
                             if frozen.is_null(i) {
                                 av_vec.push(AnyValue::Null);
                             } else {
-                                av_vec.push(AnyValue::StringOwned(PlSmallStr::from(frozen.value(i))));
+                                av_vec
+                                    .push(AnyValue::StringOwned(PlSmallStr::from(frozen.value(i))));
                             }
                         }
                     }
                     TypedCol::DateTime(vec, bitmap) => {
                         for (i, v) in vec.drain(..).enumerate() {
                             let valid = bitmap.get(i);
-                            av_vec.push(if valid { AnyValue::Datetime(v, TimeUnit::Nanoseconds, None) } else { AnyValue::Null });
+                            av_vec.push(if valid {
+                                AnyValue::Datetime(v, TimeUnit::Nanoseconds, None)
+                            } else {
+                                AnyValue::Null
+                            });
                         }
                     }
                     TypedCol::AnyValue(vec) => {
@@ -341,17 +413,29 @@ impl TypedCol {
                 match col {
                     TypedCol::Int64(vec, bitmap) => {
                         for (i, v) in vec.into_iter().enumerate() {
-                            if bitmap.get(i) { av_vec.push(AnyValue::Int64(v)); } else { av_vec.push(AnyValue::Null); }
+                            if bitmap.get(i) {
+                                av_vec.push(AnyValue::Int64(v));
+                            } else {
+                                av_vec.push(AnyValue::Null);
+                            }
                         }
                     }
                     TypedCol::Float64(vec, bitmap) => {
                         for (i, v) in vec.into_iter().enumerate() {
-                            if bitmap.get(i) { av_vec.push(AnyValue::Float64(v)); } else { av_vec.push(AnyValue::Null); }
+                            if bitmap.get(i) {
+                                av_vec.push(AnyValue::Float64(v));
+                            } else {
+                                av_vec.push(AnyValue::Null);
+                            }
                         }
                     }
                     TypedCol::Bool(vec, bitmap) => {
                         for (i, v) in vec.into_iter().enumerate() {
-                            if bitmap.get(i) { av_vec.push(AnyValue::Boolean(v)); } else { av_vec.push(AnyValue::Null); }
+                            if bitmap.get(i) {
+                                av_vec.push(AnyValue::Boolean(v));
+                            } else {
+                                av_vec.push(AnyValue::Null);
+                            }
                         }
                     }
                     TypedCol::String(arr) => {
@@ -360,13 +444,18 @@ impl TypedCol {
                             if frozen.is_null(i) {
                                 av_vec.push(AnyValue::Null);
                             } else {
-                                av_vec.push(AnyValue::StringOwned(PlSmallStr::from(frozen.value(i))));
+                                av_vec
+                                    .push(AnyValue::StringOwned(PlSmallStr::from(frozen.value(i))));
                             }
                         }
                     }
                     TypedCol::DateTime(vec, bitmap) => {
                         for (i, v) in vec.into_iter().enumerate() {
-                            if bitmap.get(i) { av_vec.push(AnyValue::Datetime(v, TimeUnit::Nanoseconds, None)); } else { av_vec.push(AnyValue::Null); }
+                            if bitmap.get(i) {
+                                av_vec.push(AnyValue::Datetime(v, TimeUnit::Nanoseconds, None));
+                            } else {
+                                av_vec.push(AnyValue::Null);
+                            }
                         }
                     }
                     _ => {}
@@ -389,10 +478,14 @@ impl IntoAnyValue for Data {
             Data::Float(v) => AnyValue::Float64(v),
             Data::Bool(v) => AnyValue::Boolean(v),
             Data::String(v) => AnyValue::StringOwned(v),
-            Data::DateTime(v) => AnyValue::Datetime(v.to_timestamp_nanos(), TimeUnit::Nanoseconds, None),
+            Data::DateTime(v) => {
+                AnyValue::Datetime(v.to_timestamp_nanos(), TimeUnit::Nanoseconds, None)
+            }
             Data::DateTimeIso(v) => AnyValue::StringOwned(v),
             Data::DurationIso(v) => AnyValue::StringOwned(v),
-            Data::SharedStringRef(idx) => AnyValue::StringOwned(PlSmallStr::from_string(idx.to_string())),
+            Data::SharedStringRef(idx) => {
+                AnyValue::StringOwned(PlSmallStr::from_string(idx.to_string()))
+            }
             Data::Error(_) | Data::Empty => AnyValue::Null,
         }
     }
@@ -446,7 +539,10 @@ fn data_to_dtype(data: &Data) -> DataType {
         Data::Int(_) => DataType::Int64,
         Data::Float(_) => DataType::Float64,
         Data::Bool(_) => DataType::Boolean,
-        Data::String(_) | Data::SharedStringRef(_) | Data::DateTimeIso(_) | Data::DurationIso(_) => DataType::String,
+        Data::String(_)
+        | Data::SharedStringRef(_)
+        | Data::DateTimeIso(_)
+        | Data::DurationIso(_) => DataType::String,
         Data::DateTime(_) => DataType::Datetime(TimeUnit::Nanoseconds, None),
         Data::Error(_) | Data::Empty => DataType::Null,
     }
@@ -544,23 +640,23 @@ impl TypedCols {
 
     pub fn into_dataframe(&mut self) -> PolarsResult<DataFrame> {
         let max_len = self.cols.iter().map(|c| c.len()).max().unwrap_or(0);
-        let _num_cols = self.cols.len();
-
-        // 补齐所有列到 max_len
-        for col in &mut self.cols {
-            col.pad_to(max_len);
-        }
 
         let columns: Vec<Column> = std::mem::take(&mut self.cols)
             .into_iter()
             .enumerate()
-            .map(|(i, col)| {
+            .map(|(i, mut col)| {
                 let name = self.headers.get(i).map(|s| s.as_str()).unwrap_or("unknown");
-                let dtype = self.col_dtypes.get(i).and_then(|d| d.as_ref());
-                let series = if let Some(dt) = dtype {
-                    col.into_series(name.into(), dt)?
+                let series = if matches!(col, TypedCol::Empty) {
+                    // 全空列（只有 header 没数据）：零写入的 Null series
+                    Series::new_null(name.into(), max_len)
                 } else {
-                    col.into_series(name.into(), &DataType::Null)?
+                    col.pad_to(max_len);
+                    let dtype = self
+                        .col_dtypes
+                        .get(i)
+                        .and_then(|d| d.as_ref())
+                        .unwrap_or(&DataType::Null);
+                    col.into_series(name.into(), dtype)?
                 };
                 Ok::<_, polars::error::PolarsError>(series.into())
             })
@@ -635,9 +731,9 @@ pub struct DataFrameIter {
     last_processed_row: Option<u32>, // 上一个处理的绝对行号（检测行切换)
     current_sheet_name: Option<String>,
     current_sheet_idx: Option<usize>,
-    skip_rows_sorted: Vec<u32>,      // 排序后的 skip 行列表（单调递增游标查询）
-    skip_rows_idx: usize,            // skip_rows_sorted 的当前游标
-    current_row_skipped: bool,       // 缓存当前行是否被跳过
+    skip_rows_sorted: Vec<u32>, // 排序后的 skip 行列表（单调递增游标查询）
+    skip_rows_idx: usize,       // skip_rows_sorted 的当前游标
+    current_row_skipped: bool,  // 缓存当前行是否被跳过
 }
 
 impl DataFrameIter {
@@ -659,7 +755,9 @@ impl DataFrameIter {
         } else {
             Arc::new(XlsxWorkbook::open(path)?)
         };
-        Self::from_workbook(batch_size, workbook, sheet_name, sheet_idx, has_header, skip_rows, fast, config)
+        Self::from_workbook(
+            batch_size, workbook, sheet_name, sheet_idx, has_header, skip_rows, fast, config,
+        )
     }
 
     pub fn from_workbook(
@@ -675,11 +773,16 @@ impl DataFrameIter {
         let cfg_ref = config.as_ref();
         let reader = if fast {
             SheetReader::Fast(SheetFastReader::new(
-                workbook.path(), sheet_name, sheet_idx, cfg_ref,
+                workbook.path(),
+                sheet_name,
+                sheet_idx,
+                cfg_ref,
             )?)
         } else {
             SheetReader::Stream(XlsxStreamReader::from_workbook(
-                Arc::clone(&workbook), sheet_name, sheet_idx,
+                Arc::clone(&workbook),
+                sheet_name,
+                sheet_idx,
             )?)
         };
         let dim = reader.dimensions();
@@ -689,7 +792,9 @@ impl DataFrameIter {
         };
         let mut cols = TypedCols::new(&dim, batch_size);
         cols.strings = Some(Arc::clone(reader.strings()));
-        let mut skip_rows_sorted: Vec<u32> = skip_rows.map(|s| s.iter().copied().collect()).unwrap_or_default();
+        let mut skip_rows_sorted: Vec<u32> = skip_rows
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default();
         skip_rows_sorted.sort_unstable();
         let mut iter = Self {
             workbook,
@@ -726,11 +831,16 @@ impl DataFrameIter {
         let default_cfg = crate::sheet_fast::FastConfig::default();
         self.reader = if self.fast {
             SheetReader::Fast(SheetFastReader::new(
-                self.workbook.path(), sheet_name, sheet_idx, Some(&default_cfg),
+                self.workbook.path(),
+                sheet_name,
+                sheet_idx,
+                Some(&default_cfg),
             )?)
         } else {
             SheetReader::Stream(XlsxStreamReader::from_workbook(
-                Arc::clone(&self.workbook), sheet_name, sheet_idx,
+                Arc::clone(&self.workbook),
+                sheet_name,
+                sheet_idx,
             )?)
         };
         let dim = self.reader.dimensions();
@@ -767,7 +877,10 @@ impl DataFrameIter {
         let first_x = first_cell.get_position().0;
         let mut total_rows: usize;
         if self.has_header {
-            self.cols.headers.push(cell_value_to_header(first_cell.into_value(), strings.as_ref()));
+            self.cols.headers.push(cell_value_to_header(
+                first_cell.into_value(),
+                strings.as_ref(),
+            ));
             loop {
                 match self.reader.next_cell()? {
                     Some(cell) => {
@@ -778,7 +891,8 @@ impl DataFrameIter {
                                     .headers
                                     .push(format!("Unknown_{}", self.cols.headers.len()));
                             }
-                            let mut value = cell_value_to_header(cell.into_value(), strings.as_ref());
+                            let mut value =
+                                cell_value_to_header(cell.into_value(), strings.as_ref());
                             value = if value.is_empty() {
                                 format!("Unknown_{}", y)
                             } else {
@@ -810,7 +924,9 @@ impl DataFrameIter {
                 .for_each(|(i, _)| self.cols.headers.push(format!("col_{}", i)));
             total_rows = (self.reader.dimensions().end.0 - first_x + 1) as usize;
         }
-        let skip_count = self.skip_rows_sorted.iter()
+        let skip_count = self
+            .skip_rows_sorted
+            .iter()
             .filter(|&&r| r >= first_x && r <= self.reader.dimensions().end.0)
             .count();
         total_rows = total_rows.saturating_sub(skip_count);
@@ -937,7 +1053,9 @@ pub fn df_iter(
     has_header: bool,
     skip_rows: Option<&[u32]>,
 ) -> anyhow::Result<DataFrameIter> {
-    DataFrameIter::new(batch_size, path, sheet_name, sheet_idx, has_header, skip_rows, false, None)
+    DataFrameIter::new(
+        batch_size, path, sheet_name, sheet_idx, has_header, skip_rows, false, None,
+    )
 }
 
 /// Fast mode: fully decompress sharedStrings.xml then byte-scan.
@@ -951,7 +1069,9 @@ pub fn df_iter_fast(
     skip_rows: Option<&[u32]>,
     config: Option<crate::sheet_fast::FastConfig>,
 ) -> anyhow::Result<DataFrameIter> {
-    DataFrameIter::new(batch_size, path, sheet_name, sheet_idx, has_header, skip_rows, true, config)
+    DataFrameIter::new(
+        batch_size, path, sheet_name, sheet_idx, has_header, skip_rows, true, config,
+    )
 }
 
 #[cfg(test)]
@@ -1005,16 +1125,33 @@ mod multi_sheet_tests {
             .unwrap()
             .join("test_data.xlsx");
         let wb = Arc::new(XlsxWorkbook::open(&path)?);
-        let mut iter = DataFrameIter::from_workbook(Some(5), Arc::clone(&wb), Some("Sheet1"), None, true, None, false)?;
+        let mut iter = DataFrameIter::from_workbook(
+            Some(5),
+            Arc::clone(&wb),
+            Some("Sheet1"),
+            None,
+            true,
+            None,
+            false,
+            None,
+        )?;
 
         let df1 = iter.next().unwrap()?;
         let rows1 = df1.height();
-        println!("Sheet1 first batch: {} rows, cols: {:?}", rows1, df1.get_column_names());
+        println!(
+            "Sheet1 first batch: {} rows, cols: {:?}",
+            rows1,
+            df1.get_column_names()
+        );
 
         iter.select_sheet(Some("Sheet2"), None)?;
         let df2 = iter.next().unwrap()?;
         let rows2 = df2.height();
-        println!("Sheet2 first batch: {} rows, cols: {:?}", rows2, df2.get_column_names());
+        println!(
+            "Sheet2 first batch: {} rows, cols: {:?}",
+            rows2,
+            df2.get_column_names()
+        );
 
         Ok(())
     }
@@ -1057,7 +1194,11 @@ mod skip_rows_tests {
             let df = batch?;
             println!("batch {}: {} rows", i, df.height());
             if i == 0 {
-                assert_eq!(df.height(), 5, "first batch should have 5 rows (row 1 skipped before batch)");
+                assert_eq!(
+                    df.height(),
+                    5,
+                    "first batch should have 5 rows (row 1 skipped before batch)"
+                );
             }
             break;
         }
@@ -1167,12 +1308,12 @@ mod zero_copy_tests {
             offsets: vec![(0, 5), (6, 5), (12, 3), (16, 3)],
         };
         let mut col = TypedCol::String(MutablePlString::with_capacity(4));
-        
+
         col.push_shared_string_ref(0, &strings); // "hello" (5 bytes) -> inline
         col.push_shared_string_ref(1, &strings); // "world" (5 bytes) -> inline
         col.push_shared_string_ref(2, &strings); // "foo" (3 bytes) -> inline
         col.push_shared_string_ref(3, &strings); // "bar" (3 bytes) -> inline
-        
+
         // 所有字符串 <=12 bytes，应该全部被 inline，不引用外部 buffer
         if let TypedCol::String(arr) = &col {
             assert_eq!(arr.len(), 4);
@@ -1195,9 +1336,9 @@ mod zero_copy_tests {
             offsets: vec![(0, 100)],
         };
         let mut col = TypedCol::String(MutablePlString::with_capacity(1));
-        
+
         col.push_shared_string_ref(0, &strings); // 100 bytes -> non-inline, 引用外部 buffer
-        
+
         if let TypedCol::String(arr) = &col {
             assert_eq!(arr.len(), 1);
             // 应该引用外部 buffer，completed_buffers 里应该有 1 个 buffer

@@ -228,10 +228,12 @@ impl XlsxWorkbook {
     ) -> Result<SharedStrings> {
         let mut file = match archive.by_name("xl/sharedStrings.xml") {
             Ok(f) => f,
-            Err(_) => return Ok(SharedStrings {
-                buffer: Buffer::from_vec(Vec::new()),
-                offsets: Vec::new(),
-            }),
+            Err(_) => {
+                return Ok(SharedStrings {
+                    buffer: Buffer::from_vec(Vec::new()),
+                    offsets: Vec::new(),
+                });
+            }
         };
 
         if fast {
@@ -334,8 +336,12 @@ impl XlsxWorkbook {
             let mut chunk = vec![0u8; 8 * 1024 * 1024];
             loop {
                 let n = file.read(&mut chunk)?;
-                if n == 0 { break; }
-                if tx.send(chunk[..n].to_vec()).is_err() { break; }
+                if n == 0 {
+                    break;
+                }
+                if tx.send(chunk[..n].to_vec()).is_err() {
+                    break;
+                }
             }
             Ok(())
         });
@@ -346,18 +352,16 @@ impl XlsxWorkbook {
 
         while let Ok(data) = rx.recv() {
             accumulate.extend_from_slice(&data);
-            let processed = process_complete_sis_concurrent(
-                &accumulate, &mut buffer, &mut offsets, false,
-            )?;
+            let processed =
+                process_complete_sis_concurrent(&accumulate, &mut buffer, &mut offsets, false)?;
             if processed > 0 {
                 accumulate.drain(..processed);
             }
         }
 
         if !accumulate.is_empty() {
-            let _processed = process_complete_sis_concurrent(
-                &accumulate, &mut buffer, &mut offsets, true,
-            )?;
+            let _processed =
+                process_complete_sis_concurrent(&accumulate, &mut buffer, &mut offsets, true)?;
         }
 
         decompress_handle
@@ -374,7 +378,9 @@ impl XlsxWorkbook {
     /// In-place: reuses the decompressed XML buffer, eliminating the extra
     /// 2GB buffer allocation. With exact-capacity pre-allocation peak memory
     /// stays at ~2.4 GB (2 GB xml + 430 MB offsets) instead of ~5 GB.
-    fn parse_shared_strings_fast(mut xml: Vec<u8>) -> Result<SharedStrings, (Vec<u8>, anyhow::Error)> {
+    fn parse_shared_strings_fast(
+        mut xml: Vec<u8>,
+    ) -> Result<SharedStrings, (Vec<u8>, anyhow::Error)> {
         let mut offsets = Vec::with_capacity(xml.len() / 32);
         let mut write_pos = 0;
         let mut i = 0;
@@ -442,7 +448,10 @@ impl XlsxWorkbook {
 
             // XML entity check in text content
             if si_content[t_start..t_start + text_len].contains(&b'&') {
-                return Err((xml, anyhow!("XML entity in text not supported in fast path")));
+                return Err((
+                    xml,
+                    anyhow!("XML entity in text not supported in fast path"),
+                ));
             }
 
             // In-place memmove: copy text forward to overwrite XML tags.
@@ -591,7 +600,9 @@ impl XlsxWorkbook {
 /// Find the first occurrence of `needle` in `haystack` using byte-window comparison.
 #[inline]
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 #[cfg(test)]
@@ -635,15 +646,22 @@ mod tests {
         let size = file.size() as usize;
         let mut xml = Vec::with_capacity(size);
         let t_alloc = t2.elapsed().as_secs_f64();
-        eprintln!("③ Vec::with_capacity({:.0}MB) : {:.3}s", size as f64 / 1024.0 / 1024.0, t_alloc);
+        eprintln!(
+            "③ Vec::with_capacity({:.0}MB) : {:.3}s",
+            size as f64 / 1024.0 / 1024.0,
+            t_alloc
+        );
 
         // 阶段 4: read_to_end 解压
         let t3 = Instant::now();
         file.read_to_end(&mut xml).unwrap();
         drop(file); // release mutable borrow on archive
         let t_read = t3.elapsed().as_secs_f64();
-        eprintln!("④ read_to_end (解压)          : {:.3}s  [{:.0} MB/s]",
-                  t_read, xml.len() as f64 / 1024.0 / 1024.0 / t_read);
+        eprintln!(
+            "④ read_to_end (解压)          : {:.3}s  [{:.0} MB/s]",
+            t_read,
+            xml.len() as f64 / 1024.0 / 1024.0 / t_read
+        );
 
         // 阶段 5: parse_shared_strings_fast
         let t4 = Instant::now();
@@ -692,7 +710,10 @@ mod tests {
             let xml2 = xml.clone();
             let t0 = Instant::now();
             let _ss = XlsxWorkbook::parse_shared_strings_fast(xml2).unwrap();
-            eprintln!("A. 完整版（含检查）           : {:.3}s", t0.elapsed().as_secs_f64());
+            eprintln!(
+                "A. 完整版（含检查）           : {:.3}s",
+                t0.elapsed().as_secs_f64()
+            );
         }
 
         // 方案 B: 仅 find_subsequence（4 次搜索）
@@ -711,7 +732,7 @@ mod tests {
                                 ts += 1;
                             }
                             ts += 1;
-                            if let Some(te) = find_subsequence(&si_content[ts..], b"</t>") {
+                            if let Some(_te) = find_subsequence(&si_content[ts..], b"</t>") {
                                 count += 1;
                                 i += e + 5;
                                 continue;
@@ -724,7 +745,11 @@ mod tests {
                 }
                 break;
             }
-            eprintln!("B. 仅 find_subsequence（4次） : {:.3}s  [count={}]", t0.elapsed().as_secs_f64(), count);
+            eprintln!(
+                "B. 仅 find_subsequence（4次） : {:.3}s  [count={}]",
+                t0.elapsed().as_secs_f64(),
+                count
+            );
         }
 
         // 方案 C: 仅 find_subsequence（2 次搜索，像 raw 测试）
@@ -743,7 +768,11 @@ mod tests {
                 }
                 break;
             }
-            eprintln!("C. 仅 find_subsequence（2次） : {:.3}s  [count={}]", t0.elapsed().as_secs_f64(), count);
+            eprintln!(
+                "C. 仅 find_subsequence（2次） : {:.3}s  [count={}]",
+                t0.elapsed().as_secs_f64(),
+                count
+            );
         }
 
         // 方案 D: 4 次搜索 + <r>/CDATA 检查
@@ -764,7 +793,7 @@ mod tests {
                                 ts += 1;
                             }
                             ts += 1;
-                            if let Some(te) = find_subsequence(&si_content[ts..], b"</t>") {
+                            if let Some(_te) = find_subsequence(&si_content[ts..], b"</t>") {
                                 count += 1;
                                 i += e + 5;
                                 continue;
@@ -777,7 +806,11 @@ mod tests {
                 }
                 break;
             }
-            eprintln!("D. 4次搜索 + <r>/CDATA 检查  : {:.3}s  [count={}]", t0.elapsed().as_secs_f64(), count);
+            eprintln!(
+                "D. 4次搜索 + <r>/CDATA 检查  : {:.3}s  [count={}]",
+                t0.elapsed().as_secs_f64(),
+                count
+            );
         }
 
         // 方案 E: 4 次搜索 + <r>/CDATA 检查 + ptr::copy
@@ -827,7 +860,11 @@ mod tests {
                 break;
             }
             xml2.truncate(write_pos);
-            eprintln!("E. 4次搜索 + 检查 + ptr::copy : {:.3}s  [count={}]", t0.elapsed().as_secs_f64(), count);
+            eprintln!(
+                "E. 4次搜索 + 检查 + ptr::copy : {:.3}s  [count={}]",
+                t0.elapsed().as_secs_f64(),
+                count
+            );
         }
 
         eprintln!("{}", sep);
@@ -837,7 +874,9 @@ mod tests {
     #[test]
     fn profile_offsets_push() {
         let path = Path::new(TEST_FILE);
-        if !path.exists() { return; }
+        if !path.exists() {
+            return;
+        }
 
         let file = std::fs::File::open(path).unwrap();
         let reader = BufReader::new(file);
@@ -893,7 +932,11 @@ mod tests {
             for &(start, len) in &positions {
                 offsets.push((start as u32, len as u32));
             }
-            eprintln!("A. push (u32,u32) × {}       : {:.3}s", positions.len(), t0.elapsed().as_secs_f64());
+            eprintln!(
+                "A. push (u32,u32) × {}       : {:.3}s",
+                positions.len(),
+                t0.elapsed().as_secs_f64()
+            );
         }
 
         // B: 同时做 ptr::copy + push
@@ -914,7 +957,11 @@ mod tests {
                 write_pos += len;
             }
             xml2.truncate(write_pos);
-            eprintln!("B. ptr::copy + push × {}     : {:.3}s", positions.len(), t0.elapsed().as_secs_f64());
+            eprintln!(
+                "B. ptr::copy + push × {}     : {:.3}s",
+                positions.len(),
+                t0.elapsed().as_secs_f64()
+            );
         }
 
         // C: 用 extend_from_slice + push（像低内存模式）
@@ -927,7 +974,11 @@ mod tests {
                 buffer.extend_from_slice(&xml[start..start + len]);
                 offsets.push((start_idx, len as u32));
             }
-            eprintln!("C. extend + push × {}        : {:.3}s", positions.len(), t0.elapsed().as_secs_f64());
+            eprintln!(
+                "C. extend + push × {}        : {:.3}s",
+                positions.len(),
+                t0.elapsed().as_secs_f64()
+            );
         }
 
         eprintln!("{}", sep);
@@ -937,7 +988,9 @@ mod tests {
     #[test]
     fn profile_contains_ampersand() {
         let path = Path::new(TEST_FILE);
-        if !path.exists() { return; }
+        if !path.exists() {
+            return;
+        }
 
         let file = std::fs::File::open(path).unwrap();
         let reader = BufReader::new(file);
@@ -995,7 +1048,12 @@ mod tests {
                     count += 1;
                 }
             }
-            eprintln!("A. contains(&b'&') × {}      : {:.3}s  [hits={}]", texts.len(), t0.elapsed().as_secs_f64(), count);
+            eprintln!(
+                "A. contains(&b'&') × {}      : {:.3}s  [hits={}]",
+                texts.len(),
+                t0.elapsed().as_secs_f64(),
+                count
+            );
         }
 
         // B: 扫描文本中的每个字节（模拟最坏情况）
@@ -1009,7 +1067,12 @@ mod tests {
                     }
                 }
             }
-            eprintln!("B. 逐字节扫描 × {}           : {:.3}s  [hits={}]", texts.len(), t0.elapsed().as_secs_f64(), count);
+            eprintln!(
+                "B. 逐字节扫描 × {}           : {:.3}s  [hits={}]",
+                texts.len(),
+                t0.elapsed().as_secs_f64(),
+                count
+            );
         }
 
         eprintln!("{}", sep);
@@ -1019,14 +1082,19 @@ mod tests {
     #[test]
     fn profile_decompress_speed() {
         let path = Path::new(TEST_FILE);
-        if !path.exists() { return; }
+        if !path.exists() {
+            return;
+        }
 
         let sep: String = std::iter::repeat('=').take(60).collect();
         eprintln!("\n{}", sep);
         eprintln!("解压速度对比 — sharedStrings.xml vs sheet1.xml");
         eprintln!("{}", sep);
 
-        for (name, entry_name) in [("sharedStrings.xml", "xl/sharedStrings.xml"), ("sheet1.xml", "xl/worksheets/sheet1.xml")] {
+        for (name, entry_name) in [
+            ("sharedStrings.xml", "xl/sharedStrings.xml"),
+            ("sheet1.xml", "xl/worksheets/sheet1.xml"),
+        ] {
             let file = std::fs::File::open(path).unwrap();
             let reader = BufReader::new(file);
             let mut archive = ZipArchive::new(reader).unwrap();
@@ -1046,10 +1114,13 @@ mod tests {
                 let t0 = Instant::now();
                 f.read_to_end(&mut xml).unwrap();
                 let dt = t0.elapsed().as_secs_f64();
-                eprintln!("{} | read_to_end: {:.3}s  [{:.0} MB/s uncompressed, {:.0} MB/s compressed]",
-                          name, dt,
-                          uncompressed as f64 / 1024.0 / 1024.0 / dt,
-                          compressed as f64 / 1024.0 / 1024.0 / dt);
+                eprintln!(
+                    "{} | read_to_end: {:.3}s  [{:.0} MB/s uncompressed, {:.0} MB/s compressed]",
+                    name,
+                    dt,
+                    uncompressed as f64 / 1024.0 / 1024.0 / dt,
+                    compressed as f64 / 1024.0 / 1024.0 / dt
+                );
             }
 
             // 方案 B: read loop (1MB buf)
@@ -1063,14 +1134,19 @@ mod tests {
                 let t0 = Instant::now();
                 loop {
                     let n = f.read(&mut buf).unwrap();
-                    if n == 0 { break; }
+                    if n == 0 {
+                        break;
+                    }
                     total += n;
                 }
                 let dt = t0.elapsed().as_secs_f64();
-                eprintln!("{} | read loop  : {:.3}s  [{:.0} MB/s uncompressed, {:.0} MB/s compressed]",
-                          name, dt,
-                          total as f64 / 1024.0 / 1024.0 / dt,
-                          compressed as f64 / 1024.0 / 1024.0 / dt);
+                eprintln!(
+                    "{} | read loop  : {:.3}s  [{:.0} MB/s uncompressed, {:.0} MB/s compressed]",
+                    name,
+                    dt,
+                    total as f64 / 1024.0 / 1024.0 / dt,
+                    compressed as f64 / 1024.0 / 1024.0 / dt
+                );
             }
 
             // 方案 C: read loop (8MB buf)
@@ -1084,14 +1160,19 @@ mod tests {
                 let t0 = Instant::now();
                 loop {
                     let n = f.read(&mut buf).unwrap();
-                    if n == 0 { break; }
+                    if n == 0 {
+                        break;
+                    }
                     total += n;
                 }
                 let dt = t0.elapsed().as_secs_f64();
-                eprintln!("{} | read loop8M: {:.3}s  [{:.0} MB/s uncompressed, {:.0} MB/s compressed]",
-                          name, dt,
-                          total as f64 / 1024.0 / 1024.0 / dt,
-                          compressed as f64 / 1024.0 / 1024.0 / dt);
+                eprintln!(
+                    "{} | read loop8M: {:.3}s  [{:.0} MB/s uncompressed, {:.0} MB/s compressed]",
+                    name,
+                    dt,
+                    total as f64 / 1024.0 / 1024.0 / dt,
+                    compressed as f64 / 1024.0 / 1024.0 / dt
+                );
             }
         }
 
@@ -1103,7 +1184,9 @@ mod tests {
     #[test]
     fn profile_concurrent_decompress_parse() {
         let path = Path::new(TEST_FILE);
-        if !path.exists() { return; }
+        if !path.exists() {
+            return;
+        }
 
         let sep: String = std::iter::repeat('=').take(60).collect();
         eprintln!("\n{}", sep);
@@ -1147,8 +1230,12 @@ mod tests {
                 let mut chunk = vec![0u8; 8 * 1024 * 1024];
                 loop {
                     let n = f.read(&mut chunk).unwrap();
-                    if n == 0 { break; }
-                    if tx.send(chunk[..n].to_vec()).is_err() { break; }
+                    if n == 0 {
+                        break;
+                    }
+                    if tx.send(chunk[..n].to_vec()).is_err() {
+                        break;
+                    }
                 }
             });
 
@@ -1158,19 +1245,27 @@ mod tests {
 
             while let Ok(data) = rx.recv() {
                 accumulate.extend_from_slice(&data);
-                let processed = process_complete_sis_concurrent(&accumulate, &mut buffer, &mut offsets, false).unwrap();
+                let processed =
+                    process_complete_sis_concurrent(&accumulate, &mut buffer, &mut offsets, false)
+                        .unwrap();
                 if processed > 0 {
                     accumulate.drain(..processed);
                 }
             }
 
             if !accumulate.is_empty() {
-                let _processed = process_complete_sis_concurrent(&accumulate, &mut buffer, &mut offsets, true).unwrap();
+                let _processed =
+                    process_complete_sis_concurrent(&accumulate, &mut buffer, &mut offsets, true)
+                        .unwrap();
             }
 
             decompress_handle.join().unwrap();
             let dt = t0.elapsed().as_secs_f64();
-            eprintln!("B. 并发 (channel + extend 1GB) : {:.3}s  [offsets={}]", dt, offsets.len());
+            eprintln!(
+                "B. 并发 (channel + extend 1GB) : {:.3}s  [offsets={}]",
+                dt,
+                offsets.len()
+            );
         }
 
         // 方案 C: 并发 — 预分配更大 buffer（2GB）
@@ -1187,8 +1282,12 @@ mod tests {
                 let mut chunk = vec![0u8; 8 * 1024 * 1024];
                 loop {
                     let n = f.read(&mut chunk).unwrap();
-                    if n == 0 { break; }
-                    if tx.send(chunk[..n].to_vec()).is_err() { break; }
+                    if n == 0 {
+                        break;
+                    }
+                    if tx.send(chunk[..n].to_vec()).is_err() {
+                        break;
+                    }
                 }
             });
 
@@ -1198,24 +1297,31 @@ mod tests {
 
             while let Ok(data) = rx.recv() {
                 accumulate.extend_from_slice(&data);
-                let processed = process_complete_sis_concurrent(&accumulate, &mut buffer, &mut offsets, false).unwrap();
+                let processed =
+                    process_complete_sis_concurrent(&accumulate, &mut buffer, &mut offsets, false)
+                        .unwrap();
                 if processed > 0 {
                     accumulate.drain(..processed);
                 }
             }
 
             if !accumulate.is_empty() {
-                let _processed = process_complete_sis_concurrent(&accumulate, &mut buffer, &mut offsets, true).unwrap();
+                let _processed =
+                    process_complete_sis_concurrent(&accumulate, &mut buffer, &mut offsets, true)
+                        .unwrap();
             }
 
             decompress_handle.join().unwrap();
             let dt = t0.elapsed().as_secs_f64();
-            eprintln!("C. 并发 (预分配2GB buffer)      : {:.3}s  [offsets={}]", dt, offsets.len());
+            eprintln!(
+                "C. 并发 (预分配2GB buffer)      : {:.3}s  [offsets={}]",
+                dt,
+                offsets.len()
+            );
         }
 
         eprintln!("{}", sep);
     }
-
 }
 
 /// Streaming byte-scanner for `<si><t>...</t></si>` used by the concurrent
@@ -1232,7 +1338,9 @@ fn process_complete_sis_concurrent(
         let si_pos = match find_subsequence(&data[i..], b"<si>") {
             Some(p) => p,
             None => {
-                if at_eof { return Ok(data.len()); }
+                if at_eof {
+                    return Ok(data.len());
+                }
                 break;
             }
         };

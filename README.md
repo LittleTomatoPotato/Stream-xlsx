@@ -234,6 +234,26 @@ main thread (按 seq 顺序重组 + 输出 DataFrame)
 - **CHUNK_SIZE=1000**:每个 chunk 包含 1000 cells,在 channel 往返开销和 worker 利用率之间取得平衡
 - **天然背压**:queue 容量 = parallelism + 1,worker 满载时 scanner 自动阻塞
 
+#### 已知瓶颈:chunk 切分
+
+实测将 `--fast-parallelism` 从 1 调到 8,fast 模式的吞吐变化很小(~3x 加速已基本吃尽
+worker 池能贡献的上限,继续堆 worker 不再变快),说明瓶颈不在 worker 侧,而在
+**单线程 scanner 的 chunk 切分**。
+
+曾尝试用 `memchr` 加速边界扫描,实际比当前实现还慢,推测原因是:
+- 切分过程中需要把每个 chunk 区间 `to_vec` 拷贝成独立 buffer 交给 worker
+- 大文件下切分次数极多(每 1000 cells 一次),频繁的小块分配/拷贝是主要开销
+
+这意味着两点:
+- **当前 fast 模式已基本贴近"切分 + 解析"两阶段的理论上限**,再要提速必须
+  解决切分侧分配问题——例如 zero-copy `Bytes` / `BytesMut` 切片,或把切分逻辑
+  移进 worker 让解压直接落到 per-worker buffer
+- **sharedStrings 也是边解压边解析的同类管线**——一旦切分提速,共享字符串的
+  fast 路径可以同步受益,因为它和 sheet XML 共用同一套切分 / 派发机制
+
+有兴趣的同学可以从 `stream_xlsx/src/sheet_fast.rs` 的 scanner 入手,尝试用
+`bytes::Bytes` / `bytes::BytesMut` 替换 `to_vec` 路径。
+
 ### 零拷贝 DataFrame 构建
 
 数字列(Int64 / Float64 / Bool / DateTime):

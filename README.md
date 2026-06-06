@@ -107,9 +107,13 @@ for df in reader:
 
 **测试文件**:`test_100w_60c.xlsx`(100 万行 × 60 列,通过 `sxlsx test test-file --rows 1000000 --col 60` 生成,约 659 MB,59,500,954 个 cell)
 
-**测试环境**:macOS (Apple Silicon),Rust release(`opt-level=3`, `lto=fat`, `codegen-units=1`)
+CLI 基准通过 `sxlsx test count` 测试,以 `psutil` 采样式记录 RSS;Python 基准在 Python 进程内对 `stream_xlsx_py` 与 `polars.read_excel` 进行对比。所有构建均为 Rust release(`opt-level=3`, `lto=fat`, `codegen-units=1`)。
 
-### default 模式 vs fast 模式
+下面分别给出两套环境的结果,再在末尾做横向对比。
+
+### macOS — Apple M5
+
+**测试环境**:macOS,CPU 为 **Apple M5**(性能核 + 能效核,统一内存架构),Rust release。
 
 ![Elapsed Time & Peak Memory Comparison](docs/benchmark/comparison_bars.png)
 
@@ -141,6 +145,53 @@ for df in reader:
 | default | fast |
 |---------|------|
 | ![default mode memory](docs/benchmark/memory_default.png) | ![fast mode memory](docs/benchmark/memory_fast.png) |
+
+### Ubuntu — Intel i7-12700KF
+
+**测试环境**:Ubuntu (Linux 6.17),CPU 为 **Intel Core i7-12700KF**(8 性能核 + 4 能效核,共 20 线程,DDR4 内存),CLI 模式(`./sxlsx test count`),Rust release。
+
+![Ubuntu — Elapsed Time & Peak Memory Comparison](benchmark_plots/comparison_bars.png)
+
+| batch_size | default 时间 | fast 时间 | 加速 | default 内存 | fast 内存 |
+|-----------|-------------|----------|------|-------------|----------|
+| 1,000     | 19.46 s     | **5.87 s** | **3.3x** | 1,651 MB    | 1,659 MB |
+| 5,000     | 19.62 s     | **5.82 s** | **3.4x** | 1,652 MB    | 1,658 MB |
+| 10,000    | 19.42 s     | **5.82 s** | **3.3x** | 1,656 MB    | 1,663 MB |
+| 50,000    | 19.62 s     | **5.82 s** | **3.4x** | 1,691 MB    | 1,698 MB |
+| 100,000   | 19.91 s     | **5.87 s** | **3.4x** | 1,734 MB    | 1,743 MB |
+| 1,000,000 | 19.57 s     | **6.47 s** | **3.0x** | 2,523 MB    | 2,526 MB |
+
+内存曲线(`bs=10000` 为推荐配置):
+
+![Ubuntu — Memory curve, batch=10000](benchmark_plots/memory_batch_10000.png)
+
+| default | fast |
+|---------|------|
+| ![Ubuntu default mode memory](benchmark_plots/memory_default.png) | ![Ubuntu fast mode memory](benchmark_plots/memory_fast.png) |
+
+> 📦 原始数据:[`benchmark_results.csv`](benchmark_results.csv)、[`benchmark_timeseries.json`](benchmark_timeseries.json);完整内存曲线见 [`benchmark_plots/`](benchmark_plots/)。
+
+**关键观察**(Ubuntu 视角):
+- **绝对时间**:default 模式 ~19.5s、fast 模式 ~5.9s,fast 模式 **3.0–3.4x** 加速比,加速比和 Mac M5 上的 ~3x 处于同一量级
+- **fast 模式时间更接近 Mac M5**:Ubuntu fast 模式 5.8–5.9s,Mac M5 fast 模式 4.8–4.9s,差距仅 ~1s;**default 模式差距更大**(Ubuntu ~19.5s vs Mac ~15.1s),说明 default 模式对单核 / 内存带宽更敏感,而 fast 模式的并发能把 i7-12700KF 的多核尽量拉满
+- **内存优势明显**:Ubuntu 上 default 模式最低 1,651 MB,fast 模式最低 1,658 MB,比 Mac M5 的 2,009 / 2,685 MB **低 20–40%**——这是 DDR4 不分页 / 不压缩、统一内存没有显式拷贝开销等因素的综合结果
+
+### 跨平台对比:Mac M5 vs Ubuntu i7-12700KF
+
+把两套环境的关键 batch_size 放在一起,fast 模式加速比、内存占用:
+
+| batch_size | Mac M5 default | Ubuntu default | Mac M5 fast | Ubuntu fast | Mac 加速 | Ubuntu 加速 | Mac fast 内存 | Ubuntu fast 内存 |
+|-----------|---------------|---------------|-------------|-------------|---------|-------------|--------------|-----------------|
+| 10,000    | 15.28 s       | 19.42 s       | **4.84 s**  | **5.82 s**  | 3.2x    | 3.3x        | 2,692 MB     | **1,663 MB**    |
+| 50,000    | 15.51 s       | 19.62 s       | **4.87 s**  | **5.82 s**  | 3.2x    | 3.4x        | 2,728 MB     | **1,698 MB**    |
+| 100,000   | 15.15 s       | 19.91 s       | **4.77 s**  | **5.87 s**  | 3.2x    | 3.4x        | 2,772 MB     | **1,743 MB**    |
+| 1,000,000 | 15.22 s       | 19.57 s       | **5.53 s**  | **6.47 s**  | 2.8x    | 3.0x        | 3,545 MB     | **2,526 MB**    |
+
+**关键观察**:
+- **fast 模式加速比跨平台接近**:Mac 2.8–3.2x、Ubuntu 3.0–3.4x,差异在 0.2x 以内,说明并发切分 + worker 池的设计在两种 CPU 架构上都能稳定给出 ~3x
+- **Mac M5 在 default 模式下更快**(15.1s vs 19.5s,约 1.3x):M5 的内存子系统 + 单核 IPC 在 default 这种单线程路径上有优势
+- **Ubuntu i7-12700KF 内存占用全面低于 Mac M5**:fast 模式 1.6–2.5 GB vs 2.7–3.5 GB,default 模式 1.65–2.5 GB vs 2.0–2.9 GB,差距在 15–45%
+- **i7-12700KF 有 20 线程,fast 模式仍然只跑 8 个 worker**(`min(8, cores/2)=8`),所以**还没吃满所有核**;Mac M5 性能核 4–6 个,`min(8, cores/2)` 通常也是 4–6,worker 数本身和 M5 性能核更匹配,这也是为什么 fast 模式绝对时间两平台接近的原因之一
 
 ### Python 环境对比
 

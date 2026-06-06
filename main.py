@@ -6,9 +6,7 @@ def main():
     start = time.time()
     # 用我们的 Rust 流式库读取
     print("=== stream_xlsx (惰性迭代器) ===")
-    reader = stream_xlsx_py.read_xlsx(
-        "test_100w_60c.xlsx", batch_size=100000, fast=True
-    )
+    reader = stream_xlsx_py.read_xlsx("test_100w_60c.xlsx", batch_size=None, fast=True)
     count = 0
     for df in reader:
         print(df)

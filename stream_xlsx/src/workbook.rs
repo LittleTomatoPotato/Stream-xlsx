@@ -9,6 +9,33 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use zip::ZipArchive;
 
+const SUPPORTED_WORKBOOK_EXTENSIONS: &[&str] = &["xlsx", "xltx", "xlsm", "xltm"];
+const SUPPORTED_WORKBOOK_EXTENSIONS_DISPLAY: &str = ".xlsx, .xltx, .xlsm, .xltm";
+
+fn validate_workbook_extension(path: &Path) -> Result<()> {
+    let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+        return Err(anyhow!(
+            "Unsupported workbook path '{}': expected one of {}",
+            path.display(),
+            SUPPORTED_WORKBOOK_EXTENSIONS_DISPLAY
+        ));
+    };
+
+    if SUPPORTED_WORKBOOK_EXTENSIONS
+        .iter()
+        .any(|supported| extension.eq_ignore_ascii_case(supported))
+    {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "Unsupported workbook extension '.{}' for '{}': expected one of {}",
+        extension,
+        path.display(),
+        SUPPORTED_WORKBOOK_EXTENSIONS_DISPLAY
+    ))
+}
+
 /// 连续 buffer + offsets 形式的共享字符串表，可被 Arrow StringView 零拷贝引用。
 #[derive(Debug)]
 pub struct SharedStrings {
@@ -44,6 +71,7 @@ impl XlsxWorkbook {
 
     fn open_with_mode<P: AsRef<Path>>(path: P, fast_shared_strings: bool) -> Result<Self> {
         let path = path.as_ref().to_owned();
+        validate_workbook_extension(&path)?;
         let file = std::fs::File::open(&path)?;
         let reader = BufReader::new(file);
         let mut archive = ZipArchive::new(reader)?;
@@ -612,6 +640,41 @@ mod tests {
     use std::time::Instant;
 
     const TEST_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../test_100w_60c.xlsx");
+
+    #[test]
+    fn validates_supported_workbook_extensions_case_insensitively() {
+        for extension in SUPPORTED_WORKBOOK_EXTENSIONS {
+            let lowercase = format!("workbook.{extension}");
+            assert!(validate_workbook_extension(Path::new(&lowercase)).is_ok());
+
+            let uppercase = format!("workbook.{}", extension.to_ascii_uppercase());
+            assert!(validate_workbook_extension(Path::new(&uppercase)).is_ok());
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_or_missing_workbook_extensions() {
+        for path in [
+            "workbook.xls",
+            "workbook.xlsb",
+            "workbook",
+            "workbook.xlsx.zip",
+        ] {
+            let error = validate_workbook_extension(Path::new(path)).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains(SUPPORTED_WORKBOOK_EXTENSIONS_DISPLAY));
+        }
+    }
+
+    #[test]
+    fn open_applies_workbook_extension_validation() {
+        let error = XlsxWorkbook::open("workbook.xls").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(SUPPORTED_WORKBOOK_EXTENSIONS_DISPLAY)
+        );
+    }
 
     /// 精确测量 init() 每个子阶段的耗时，找出 4.2s 与 2.5s 的差距。
     #[test]

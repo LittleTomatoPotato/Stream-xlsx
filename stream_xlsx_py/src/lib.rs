@@ -61,7 +61,7 @@ impl XlsxReader {
     }
 }
 
-/// 打开 xlsx 文件，返回一个惰性迭代器（Python generator 语义）
+/// 打开 xlsx/xltx/xlsm/xltm 文件，返回一个惰性迭代器（Python generator 语义）
 ///
 /// 参数:
 /// - path: 文件路径

@@ -1,9 +1,60 @@
+use polars::prelude::{Schema, SchemaRef};
 use pyo3::prelude::*;
-use pyo3_polars::PyDataFrame;
+use pyo3_polars::{PyDataFrame, PyDataType};
 use std::sync::Arc;
-use stream_xlsx::df_iter::DataFrameIter;
-use stream_xlsx::workbook::XlsxWorkbook;
 use stream_xlsx::FastConfig;
+use stream_xlsx::df_iter::{DataFrameIter, StrictDataFrameIter};
+use stream_xlsx::workbook::XlsxWorkbook;
+
+enum ReaderIter {
+    Infer(DataFrameIter),
+    Strict(StrictDataFrameIter),
+}
+
+impl ReaderIter {
+    fn next(&mut self) -> Option<anyhow::Result<polars::prelude::DataFrame>> {
+        match self {
+            Self::Infer(iter) => iter.next(),
+            Self::Strict(iter) => iter.next(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Infer(iter) => iter.len(),
+            Self::Strict(iter) => iter.len(),
+        }
+    }
+
+    fn select_sheet(
+        &mut self,
+        sheet_name: Option<&str>,
+        sheet_idx: Option<usize>,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Infer(iter) => iter.select_sheet(sheet_name, sheet_idx),
+            Self::Strict(iter) => iter.select_sheet(sheet_name, sheet_idx),
+        }
+    }
+}
+
+fn parse_schema(schema: &Bound<'_, PyAny>) -> PyResult<SchemaRef> {
+    let items = schema.call_method0("items").map_err(|_| {
+        pyo3::exceptions::PyTypeError::new_err(
+            "schema 必须是保持字段顺序的 Mapping[str, polars.DataType]",
+        )
+    })?;
+    let mut parsed = Schema::with_capacity(schema.len().unwrap_or(0));
+    for item in items.try_iter()? {
+        let (name, dtype): (String, PyDataType) = item?.extract()?;
+        if parsed.insert(name.clone().into(), dtype.0).is_some() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "schema 字段 '{name}' 重复"
+            )));
+        }
+    }
+    Ok(Arc::new(parsed))
+}
 
 /// Python 可迭代的流式 xlsx 读取器
 ///
@@ -13,7 +64,7 @@ use stream_xlsx::FastConfig;
 #[pyclass(unsendable)]
 pub struct XlsxReader {
     workbook: Arc<XlsxWorkbook>,
-    inner: DataFrameIter,
+    inner: ReaderIter,
 }
 
 #[pymethods]
@@ -71,6 +122,7 @@ impl XlsxReader {
 /// - has_header: 是否将第一行作为表头，默认 True
 /// - fast: 是否使用 fast 模式（并发解析），默认 False
 /// - fast_parallelism: fast 模式 worker 线程数（可选，默认自动）
+/// - schema: 固定 Polars Schema；传入后启用严格读取（可选）
 ///
 /// 用法:
 /// ```python
@@ -83,7 +135,7 @@ impl XlsxReader {
 ///     print(df.shape)
 /// ```
 #[pyfunction]
-#[pyo3(signature = (path, batch_size=10000, sheet_name=None, sheet_idx=None, has_header=true, skip_rows=None, fast=false, fast_parallelism=None))]
+#[pyo3(signature = (path, batch_size=10000, sheet_name=None, sheet_idx=None, has_header=true, skip_rows=None, fast=false, fast_parallelism=None, schema=None))]
 fn read_xlsx(
     path: &str,
     batch_size: Option<usize>,
@@ -93,6 +145,7 @@ fn read_xlsx(
     skip_rows: Option<Vec<u32>>,
     fast: bool,
     fast_parallelism: Option<usize>,
+    schema: Option<Bound<'_, PyAny>>,
 ) -> PyResult<XlsxReader> {
     let workbook = Arc::new(
         if fast {
@@ -108,31 +161,52 @@ fn read_xlsx(
     let config = if fast {
         let mut cfg = FastConfig::default();
         if let Some(v) = fast_parallelism {
+            if v == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "fast_parallelism 必须大于 0",
+                ));
+            }
             let cores = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(8);
-            cfg.parallelism = if v > cores {
-                cores.saturating_sub(2)
-            } else {
-                v
-            };
+            cfg.parallelism = v.min(cores.max(1));
         }
         Some(cfg)
     } else {
         None
     };
 
-    let iter = DataFrameIter::from_workbook(
-        batch_size,
-        Arc::clone(&workbook),
-        sheet_name_ref,
-        sheet_idx,
-        has_header,
-        skip_rows_ref,
-        fast,
-        config,
-    )
-    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?;
+    let schema = schema.as_ref().map(parse_schema).transpose()?;
+    let iter = if let Some(schema) = schema {
+        ReaderIter::Strict(
+            StrictDataFrameIter::from_workbook_with_schema(
+                batch_size,
+                Arc::clone(&workbook),
+                sheet_name_ref,
+                sheet_idx,
+                has_header,
+                skip_rows_ref,
+                schema,
+                fast,
+                config,
+            )
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{e}")))?,
+        )
+    } else {
+        ReaderIter::Infer(
+            DataFrameIter::from_workbook(
+                batch_size,
+                Arc::clone(&workbook),
+                sheet_name_ref,
+                sheet_idx,
+                has_header,
+                skip_rows_ref,
+                fast,
+                config,
+            )
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?,
+        )
+    };
     Ok(XlsxReader {
         workbook,
         inner: iter,

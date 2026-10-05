@@ -8,28 +8,44 @@ use polars::datatypes::PlSmallStr;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::Path;
 use std::sync::Arc;
 
 const CHUNK_SIZE: usize = 256 * 1024; // 256K
 const CHANNEL_CAPACITY: usize = 4;
 
+#[derive(Debug)]
+enum ChannelMessage {
+    Data(Bytes),
+    End,
+    Error(io::Error),
+}
+
 /// 通过 channel 把后台线程的解压数据流式喂给前端 Reader。
 /// 直接实现 BufRead，省去外层的 BufReader 包裹。
 struct ChannelReader {
-    rx: std::sync::mpsc::Receiver<Bytes>,
+    rx: std::sync::mpsc::Receiver<ChannelMessage>,
     current: Bytes,
     pos: usize,
+    finished: bool,
+    terminal_error: Option<(io::ErrorKind, String)>,
 }
 
 impl ChannelReader {
-    fn new(rx: std::sync::mpsc::Receiver<Bytes>) -> Self {
+    fn new(rx: std::sync::mpsc::Receiver<ChannelMessage>) -> Self {
         Self {
             rx,
             current: Bytes::new(),
             pos: 0,
+            finished: false,
+            terminal_error: None,
         }
+    }
+
+    fn remember_error(&mut self, error: io::Error) -> io::Error {
+        self.terminal_error = Some((error.kind(), error.to_string()));
+        error
     }
 }
 
@@ -37,7 +53,11 @@ impl Read for ChannelReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let mut nread = 0;
         while nread < buf.len() {
-            let slice = self.fill_buf()?;
+            let slice = match self.fill_buf() {
+                Ok(slice) => slice,
+                Err(_error) if nread > 0 => return Ok(nread),
+                Err(error) => return Err(error),
+            };
             if slice.is_empty() {
                 break;
             }
@@ -52,13 +72,32 @@ impl Read for ChannelReader {
 
 impl BufRead for ChannelReader {
     fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if let Some((kind, message)) = &self.terminal_error {
+            return Err(io::Error::new(*kind, message.clone()));
+        }
         while self.pos >= self.current.len() {
+            if self.finished {
+                return Ok(&[]);
+            }
             match self.rx.recv() {
-                Ok(data) => {
+                Ok(ChannelMessage::Data(data)) => {
                     self.current = data;
                     self.pos = 0;
                 }
-                Err(_) => return Ok(&[]),
+                Ok(ChannelMessage::End) => {
+                    self.finished = true;
+                    return Ok(&[]);
+                }
+                Ok(ChannelMessage::Error(error)) => {
+                    return Err(self.remember_error(error));
+                }
+                Err(_) => {
+                    let error = io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "sheet decompression channel closed before completion",
+                    );
+                    return Err(self.remember_error(error));
+                }
             }
         }
         Ok(&self.current[self.pos..])
@@ -67,6 +106,65 @@ impl BufRead for ChannelReader {
     fn consume(&mut self, amt: usize) {
         self.pos = (self.pos + amt).min(self.current.len());
     }
+}
+
+fn send_sheet_data(
+    tx: std::sync::mpsc::SyncSender<ChannelMessage>,
+    path: std::path::PathBuf,
+    sheet_path: String,
+) {
+    let result = read_sheet_chunks(&path, &sheet_path, &tx);
+    let completion = match result {
+        Ok(()) => ChannelMessage::End,
+        Err(error) => ChannelMessage::Error(error),
+    };
+    let _ = tx.send(completion);
+}
+
+fn read_sheet_chunks(
+    path: &Path,
+    sheet_path: &str,
+    tx: &std::sync::mpsc::SyncSender<ChannelMessage>,
+) -> io::Result<()> {
+    let file = std::fs::File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut archive = zip::ZipArchive::new(reader).map_err(io::Error::other)?;
+    let mut zip_file = archive.by_name(sheet_path).map_err(io::Error::other)?;
+    let mut accumulate = BytesMut::with_capacity(CHUNK_SIZE * 2);
+    let mut temp = BytesMut::with_capacity(CHUNK_SIZE);
+    loop {
+        temp.reserve(CHUNK_SIZE);
+        let spare = temp.spare_capacity_mut();
+        let dst =
+            unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len()) };
+        match zip_file.read(dst) {
+            Ok(0) => {
+                if !accumulate.is_empty()
+                    && tx
+                        .send(ChannelMessage::Data(accumulate.split().freeze()))
+                        .is_err()
+                {
+                    return Ok(());
+                }
+                break;
+            }
+            Ok(n) => {
+                unsafe {
+                    temp.set_len(temp.len() + n);
+                }
+                accumulate.extend_from_slice(&temp[..n]);
+                temp.clear();
+                if accumulate.len() >= CHUNK_SIZE {
+                    let chunk = accumulate.split_to(CHUNK_SIZE).freeze();
+                    if tx.send(ChannelMessage::Data(chunk)).is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// 独立的 xlsx sheet XML 流式读取器。
@@ -84,6 +182,7 @@ pub struct XlsxStreamReader {
     #[allow(dead_code)]
     custom_date_numfmts: Arc<HashSet<u32>>,
     date_columns: Vec<Option<bool>>,
+    is_1904: bool,
     row_index: u32,
     col_index: u32,
     buf: Vec<u8>,
@@ -91,6 +190,11 @@ pub struct XlsxStreamReader {
     dimensions: Dimensions,
     in_sheet_data: bool,
     scratch_buf: Vec<u8>,
+    preserve_numeric_lexemes: bool,
+    header_merge_rows: Option<(u32, u32)>,
+    header_merges: Vec<crate::header::HeaderMergeRange>,
+    tail_depth: usize,
+    worksheet_closed: bool,
 }
 
 impl XlsxStreamReader {
@@ -127,86 +231,63 @@ impl XlsxStreamReader {
         };
 
         let path = workbook.path().to_owned();
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Bytes>(CHANNEL_CAPACITY);
-        std::thread::spawn(move || {
-            let send_result = (|| -> Result<()> {
-                let file = std::fs::File::open(&path)?;
-                let reader = BufReader::new(file);
-                let mut archive = zip::ZipArchive::new(reader)?;
-                let mut zip_file = archive.by_name(&sheet_path)?;
-                let mut accumulate = BytesMut::with_capacity(CHUNK_SIZE * 2);
-                let mut temp = BytesMut::with_capacity(CHUNK_SIZE);
-                loop {
-                    temp.reserve(CHUNK_SIZE);
-                    let spare = temp.spare_capacity_mut();
-                    let dst = unsafe {
-                        std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len())
-                    };
-                    match zip_file.read(dst) {
-                        Ok(0) => {
-                            if !accumulate.is_empty() {
-                                if tx.send(accumulate.split().freeze()).is_err() {
-                                    break;
-                                }
-                            }
-                            break;
-                        }
-                        Ok(n) => {
-                            unsafe {
-                                temp.set_len(temp.len() + n);
-                            }
-                            accumulate.extend_from_slice(&temp[..n]);
-                            temp.clear();
-                            if accumulate.len() >= CHUNK_SIZE {
-                                let chunk = accumulate.split_to(CHUNK_SIZE).freeze();
-                                if tx.send(chunk).is_err() {
-                                    break;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            return Err(e.into());
-                        }
-                    }
-                }
-                Ok(())
-            })();
-            if let Err(e) = send_result {
-                eprintln!("xlsx decompress thread error: {e}");
-            }
-        });
+        let (tx, rx) = std::sync::mpsc::sync_channel::<ChannelMessage>(CHANNEL_CAPACITY);
+        std::thread::spawn(move || send_sheet_data(tx, path, sheet_path));
 
         let channel_reader = ChannelReader::new(rx);
         let mut xml = Reader::from_reader(channel_reader);
         xml.config_mut().trim_text(true);
         let mut dimensions = Dimensions::default();
-        let mut in_sheet_data = false;
         let mut pre_buf = Vec::with_capacity(1024);
+        let mut pre_depth = 0_usize;
 
         // 预读 XML 头部，解析 dimension，定位到 sheetData
-        loop {
+        let in_sheet_data = loop {
             pre_buf.clear();
-            match xml.read_event_into(&mut pre_buf) {
-                Ok(Event::Empty(e)) | Ok(Event::Start(e))
-                    if e.local_name().as_ref() == b"dimension" =>
-                {
-                    if let Some(ref_attr) = get_attribute(&e, b"ref")? {
-                        dimensions = parse_dimension(ref_attr.as_bytes())?;
+            let event = xml
+                .read_event_into(&mut pre_buf)
+                .map_err(|error| anyhow::Error::new(error).context("XML error"))?;
+            match &event {
+                Event::Start(e) if e.local_name().as_ref() == b"sheetData" => {
+                    if pre_depth != 1 {
+                        return Err(anyhow!("sheetData 必须直接位于 worksheet 根下"));
                     }
+                    break true;
                 }
-                Ok(Event::Start(e)) if e.local_name().as_ref() == b"sheetData" => {
-                    in_sheet_data = true;
-                    break;
+                Event::Empty(e) if e.local_name().as_ref() == b"sheetData" => {
+                    if pre_depth != 1 {
+                        return Err(anyhow!("sheetData 必须直接位于 worksheet 根下"));
+                    }
+                    break false;
                 }
-                Ok(Event::Empty(e)) if e.local_name().as_ref() == b"sheetData" => {
-                    in_sheet_data = true;
-                    break;
+                Event::Start(e) => {
+                    if pre_depth == 0 && e.local_name().as_ref() != b"worksheet" {
+                        return Err(anyhow!("sheet XML 根必须为 worksheet"));
+                    }
+                    pre_depth += 1;
                 }
-                Ok(Event::Eof) => break,
-                Err(e) => return Err(anyhow!("XML error: {}", e)),
+                Event::Empty(_) if pre_depth == 0 => {
+                    return Err(anyhow!("sheet XML 根必须为 worksheet"));
+                }
+                Event::End(_) => {
+                    if pre_depth <= 1 {
+                        return Err(anyhow!("worksheet 在 sheetData 前结束"));
+                    }
+                    pre_depth -= 1;
+                }
+                Event::Text(text) if pre_depth == 0 && !text.is_empty() => {
+                    return Err(anyhow!("worksheet 前存在非空 XML 文本"));
+                }
+                Event::Eof => return Err(anyhow!("sheet XML 缺少 sheetData")),
                 _ => {}
             }
-        }
+            if let Event::Empty(e) | Event::Start(e) = &event
+                && e.local_name().as_ref() == b"dimension"
+                && let Some(ref_attr) = get_attribute(e, b"ref")?
+            {
+                dimensions = parse_dimension(ref_attr.as_bytes())?;
+            }
+        };
 
         let scratch_buf: Vec<u8> = Vec::new();
 
@@ -226,6 +307,7 @@ impl XlsxStreamReader {
             },
             custom_date_numfmts: Arc::clone(workbook.custom_date_numfmts().unwrap()),
             date_columns: vec![None; dimensions.end.1 as usize + 1],
+            is_1904: workbook.is_1904(),
             row_index: 0,
             col_index: 0,
             buf: Vec::with_capacity(1024),
@@ -233,7 +315,18 @@ impl XlsxStreamReader {
             dimensions,
             in_sheet_data,
             scratch_buf,
+            preserve_numeric_lexemes: false,
+            header_merge_rows: None,
+            header_merges: Vec::new(),
+            tail_depth: 1,
+            worksheet_closed: false,
         })
+    }
+
+    /// 按需保存数值 `<v>` 原文；普通动态读取默认关闭以避免逐单元格分配。
+    pub fn with_numeric_lexemes(mut self, preserve: bool) -> Self {
+        self.preserve_numeric_lexemes = preserve;
+        self
     }
 
     pub fn dimensions(&self) -> Dimensions {
@@ -244,7 +337,19 @@ impl XlsxStreamReader {
         &self.strings
     }
 
+    pub(crate) fn set_header_merge_rows(&mut self, first: u32, last: u32) {
+        self.header_merge_rows = Some((first, last));
+    }
+
+    pub(crate) fn take_header_merges(&mut self) -> Vec<crate::header::HeaderMergeRange> {
+        std::mem::take(&mut self.header_merges)
+    }
+
     pub fn next_cell(&mut self) -> Result<Option<Cell<Data>>> {
+        if !self.in_sheet_data {
+            self.drain_to_eof()?;
+            return Ok(None);
+        }
         loop {
             self.buf.clear();
             let event = self.xml.read_event_into(&mut self.buf);
@@ -303,16 +408,20 @@ impl XlsxStreamReader {
                 }
                 Ok(Event::End(e)) if e.local_name().as_ref() == b"sheetData" => {
                     self.in_sheet_data = false;
+                    self.drain_to_eof()?;
                     return Ok(None);
                 }
+                Ok(Event::Eof) if self.in_sheet_data => {
+                    return Err(anyhow!("sheet XML 在 sheetData 结束前截断"));
+                }
                 Ok(Event::Eof) => return Ok(None),
-                Err(e) => return Err(anyhow!("XML error: {}", e)),
+                Err(e) => return Err(anyhow::Error::new(e).context("XML error")),
                 _ => None,
             };
 
             if let Some((pos, t_attr, s_attr, is_empty)) = maybe_start {
-                let value = if is_empty {
-                    Data::Empty
+                let (value, raw_numeric_lexeme) = if is_empty {
+                    (Data::Empty, None)
                 } else {
                     let s_attr_usize = s_attr;
                     let col_idx = pos.1 as usize;
@@ -336,7 +445,71 @@ impl XlsxStreamReader {
                     };
                     self.read_cell_value(t_attr, is_date)?
                 };
-                return Ok(Some(Cell::new(pos, value)));
+                return Ok(Some(Cell::with_raw_numeric_lexeme(
+                    pos,
+                    value,
+                    raw_numeric_lexeme,
+                )));
+            }
+        }
+    }
+
+    /// 继续读完 sheet XML，确保后台 ZIP 解压及校验也已完成。
+    fn drain_to_eof(&mut self) -> Result<()> {
+        loop {
+            self.buf.clear();
+            let event = self.xml.read_event_into(&mut self.buf).map_err(|error| {
+                anyhow::Error::new(error).context("XML error after <sheetData>")
+            })?;
+            match &event {
+                Event::Eof => {
+                    if !self.worksheet_closed {
+                        return Err(anyhow!("sheet XML 在 worksheet 闭合前截断"));
+                    }
+                    return Ok(());
+                }
+                Event::Start(_)
+                | Event::Empty(_)
+                | Event::End(_)
+                | Event::CData(_)
+                | Event::Decl(_)
+                | Event::DocType(_)
+                    if self.worksheet_closed =>
+                {
+                    return Err(anyhow!("worksheet 后存在额外 XML 内容"));
+                }
+                Event::Text(text) if self.worksheet_closed && !text.is_empty() => {
+                    return Err(anyhow!("worksheet 后存在非空 XML 文本"));
+                }
+                Event::Start(_) => self.tail_depth += 1,
+                Event::End(end) => {
+                    self.tail_depth = self
+                        .tail_depth
+                        .checked_sub(1)
+                        .ok_or_else(|| anyhow!("sheet XML 尾部多出闭合标签"))?;
+                    if self.tail_depth == 0 {
+                        if end.local_name().as_ref() != b"worksheet" {
+                            return Err(anyhow!("sheet XML 根必须以 worksheet 闭合"));
+                        }
+                        self.worksheet_closed = true;
+                    }
+                }
+                _ => {}
+            }
+            if let Event::Empty(event) | Event::Start(event) = &event
+                && self.header_merge_rows.is_some()
+                && event.local_name().as_ref() == b"mergeCell"
+            {
+                let reference =
+                    get_attribute(event, b"ref")?.ok_or_else(|| anyhow!("mergeCell 缺少 ref"))?;
+                let range = crate::header::parse_merge_reference(&reference)?;
+                let (first, last) = self.header_merge_rows.expect("已检查表头范围");
+                if range.start.0 <= last && range.end.0 >= first {
+                    if self.header_merges.len() >= crate::header::MAX_COLUMNS as usize * 8 {
+                        return Err(anyhow!("表头合并范围数量超过资源上限"));
+                    }
+                    self.header_merges.push(range);
+                }
             }
         }
     }
@@ -347,8 +520,13 @@ impl XlsxStreamReader {
         false
     }
 
-    fn read_cell_value(&mut self, t_attr: Option<&str>, is_date: bool) -> Result<Data> {
+    fn read_cell_value(
+        &mut self,
+        t_attr: Option<&str>,
+        is_date: bool,
+    ) -> Result<(Data, Option<Box<str>>)> {
         let mut value = Data::Empty;
+        let mut raw_numeric_lexeme = None;
 
         loop {
             self.cell_buf.clear();
@@ -366,24 +544,47 @@ impl XlsxStreamReader {
                             Ok(Event::Text(t)) => {
                                 let text = std::str::from_utf8(t.as_ref()).unwrap_or_default();
                                 value = parse_raw_value(text, t_attr)?;
+                                if self.preserve_numeric_lexemes
+                                    && matches!(value, Data::Int(_) | Data::Float(_))
+                                {
+                                    raw_numeric_lexeme = Some(text.into());
+                                }
                                 // consume </v>
                                 self.scratch_buf.clear();
                                 match self.xml.read_event_into(&mut self.scratch_buf) {
                                     Ok(Event::End(e)) if e.local_name().as_ref() == b"v" => {}
+                                    Err(e) => {
+                                        return Err(
+                                            anyhow::Error::new(e).context("XML error in <v>")
+                                        );
+                                    }
                                     _ => return Err(anyhow!("Expected </v>")),
                                 }
                             }
                             Ok(Event::CData(t)) => {
                                 let text = std::str::from_utf8(t.as_ref()).unwrap_or_default();
                                 value = parse_raw_value(text, t_attr)?;
+                                if self.preserve_numeric_lexemes
+                                    && matches!(value, Data::Int(_) | Data::Float(_))
+                                {
+                                    raw_numeric_lexeme = Some(text.into());
+                                }
                                 self.scratch_buf.clear();
                                 match self.xml.read_event_into(&mut self.scratch_buf) {
                                     Ok(Event::End(e)) if e.local_name().as_ref() == b"v" => {}
+                                    Err(e) => {
+                                        return Err(
+                                            anyhow::Error::new(e).context("XML error in <v>")
+                                        );
+                                    }
                                     _ => return Err(anyhow!("Expected </v>")),
                                 }
                             }
                             Ok(Event::End(e)) if e.local_name().as_ref() == b"v" => {
                                 value = Data::Empty;
+                            }
+                            Err(e) => {
+                                return Err(anyhow::Error::new(e).context("XML error in <v>"));
                             }
                             _ => return Err(anyhow!("Unexpected content in <v>")),
                         }
@@ -399,7 +600,7 @@ impl XlsxStreamReader {
                 }
                 Ok(Event::End(e)) if e.local_name().as_ref() == b"c" => break,
                 Ok(Event::Eof) => return Err(anyhow!("Unexpected EOF in <c>")),
-                Err(e) => return Err(anyhow!("XML error in <c>: {}", e)),
+                Err(e) => return Err(anyhow::Error::new(e).context("XML error in <c>")),
                 _ => {}
             }
         }
@@ -407,15 +608,21 @@ impl XlsxStreamReader {
         // 日期转换：已缓存为日期列的数字单元格直接转 DateTime
         if is_date && (t_attr.is_none() || t_attr.as_deref() == Some("")) {
             value = match value {
-                Data::Int(v) => {
-                    Data::DateTime(crate::excel_types::ExcelDateTime::new(v as f64, false))
+                Data::Int(v) => Data::DateTime(crate::excel_types::ExcelDateTime::new(
+                    v as f64,
+                    self.is_1904,
+                )),
+                Data::Float(v) => {
+                    Data::DateTime(crate::excel_types::ExcelDateTime::new(v, self.is_1904))
                 }
-                Data::Float(v) => Data::DateTime(crate::excel_types::ExcelDateTime::new(v, false)),
                 other => other,
             };
         }
 
-        Ok(value)
+        if !matches!(value, Data::Int(_) | Data::Float(_) | Data::DateTime(_)) {
+            raw_numeric_lexeme = None;
+        }
+        Ok((value, raw_numeric_lexeme))
     }
 
     /// 直接从 `<v>idx</v>` 解析 shared string 索引,返回 `Data::SharedStringRef`。
@@ -445,7 +652,7 @@ impl XlsxStreamReader {
                 }
                 Ok(Event::End(e)) if e.local_name().as_ref() == b"v" => return Ok(Data::Empty),
                 Ok(Event::Eof) => return Err(anyhow!("Unexpected EOF in <v>")),
-                Err(e) => return Err(anyhow!("XML error in <v>: {}", e)),
+                Err(e) => return Err(anyhow::Error::new(e).context("XML error in <v>")),
                 _ => {}
             }
         }
@@ -466,6 +673,83 @@ impl crate::stream_reader::StreamReader for XlsxStreamReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn channel_reader_propagates_background_error_after_buffered_data() -> io::Result<()> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(CHANNEL_CAPACITY);
+        tx.send(ChannelMessage::Data(Bytes::from_static(b"partial xml")))
+            .unwrap();
+        tx.send(ChannelMessage::Error(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "corrupt sheet data",
+        )))
+        .unwrap();
+
+        let mut reader = ChannelReader::new(rx);
+        let mut buf = [0; 32];
+        let nread = reader.read(&mut buf)?;
+        assert_eq!(&buf[..nread], b"partial xml");
+
+        for _ in 0..2 {
+            let error = reader.read(&mut buf).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), "corrupt sheet data");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn channel_reader_only_treats_explicit_end_as_eof() -> io::Result<()> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(CHANNEL_CAPACITY);
+        drop(tx);
+        let mut reader = ChannelReader::new(rx);
+        let error = reader.read(&mut [0; 1]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(CHANNEL_CAPACITY);
+        tx.send(ChannelMessage::End).unwrap();
+        let mut reader = ChannelReader::new(rx);
+        assert_eq!(reader.read(&mut [0; 1])?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_sheet_zip_is_reported_as_a_read_error() -> io::Result<()> {
+        let sheet_path = "xl/worksheets/sheet1.xml";
+        let sheet_xml = b"<worksheet><sheetData/></worksheet>";
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        writer.start_file(sheet_path, options)?;
+        writer.write_all(sheet_xml)?;
+        let mut zip_data = writer.finish()?.into_inner();
+
+        let file_name_len = u16::from_le_bytes([zip_data[26], zip_data[27]]) as usize;
+        let extra_len = u16::from_le_bytes([zip_data[28], zip_data[29]]) as usize;
+        let sheet_data_offset = 30 + file_name_len + extra_len;
+        zip_data[sheet_data_offset] ^= 1;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "stream-xlsx-corrupt-sheet-{}-{unique}.xlsx",
+            std::process::id()
+        ));
+        std::fs::write(&path, zip_data)?;
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(CHANNEL_CAPACITY);
+        send_sheet_data(tx, path.clone(), sheet_path.to_string());
+        let mut reader = ChannelReader::new(rx);
+        let error = reader.read_to_end(&mut Vec::new()).unwrap_err();
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        Ok(())
+    }
+
     // #[global_allocator]
     // static ALLOC: dhat::Alloc = dhat::Alloc;
     #[test]
@@ -534,7 +818,10 @@ mod bench_tests {
             count += 1;
         }
         let dt = t0.elapsed().as_secs_f64();
-        eprintln!("A. 完整 next_cell (含解压+解析): {:.3}s  [cells={}]", dt, count);
+        eprintln!(
+            "A. 完整 next_cell (含解压+解析): {:.3}s  [cells={}]",
+            dt, count
+        );
 
         eprintln!("{}", sep);
     }
@@ -543,8 +830,8 @@ mod bench_tests {
 #[cfg(test)]
 mod bench_tests2 {
     use super::*;
-    use std::time::Instant;
     use quick_xml::events::Event;
+    use std::time::Instant;
 
     const TEST_FILE: &str = "../test_100w_60c.xlsx";
 
@@ -552,7 +839,9 @@ mod bench_tests2 {
     #[test]
     fn profile_next_cell_breakdown() {
         let path = std::path::Path::new(TEST_FILE);
-        if !path.exists() { return; }
+        if !path.exists() {
+            return;
+        }
 
         let sep: String = std::iter::repeat('=').take(60).collect();
         eprintln!("\n{}", sep);
@@ -567,7 +856,11 @@ mod bench_tests2 {
             while let Ok(Some(_cell)) = reader.next_cell() {
                 count += 1;
             }
-            eprintln!("A. 完整 next_cell                : {:.3}s  [cells={}]", t0.elapsed().as_secs_f64(), count);
+            eprintln!(
+                "A. 完整 next_cell                : {:.3}s  [cells={}]",
+                t0.elapsed().as_secs_f64(),
+                count
+            );
         }
 
         // B. 只解压，不做任何解析
@@ -581,10 +874,16 @@ mod bench_tests2 {
             let t0 = Instant::now();
             loop {
                 let n = f.read(&mut buf).unwrap();
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 total += n;
             }
-            eprintln!("B. 纯解压（不解析）               : {:.3}s  [bytes={}]", t0.elapsed().as_secs_f64(), total);
+            eprintln!(
+                "B. 纯解压（不解析）               : {:.3}s  [bytes={}]",
+                t0.elapsed().as_secs_f64(),
+                total
+            );
         }
 
         // C. 用 quick-xml 只读事件，不做任何数据转换
@@ -600,13 +899,18 @@ mod bench_tests2 {
             loop {
                 buf.clear();
                 match xml.read_event_into(&mut buf) {
-                    Ok(Event::Start(_)) | Ok(Event::End(_)) | Ok(Event::Empty(_)) | Ok(Event::Text(_)) => events += 1,
+                    Ok(Event::Start(_)) | Ok(Event::End(_)) | Ok(Event::Empty(_))
+                    | Ok(Event::Text(_)) => events += 1,
                     Ok(Event::Eof) => break,
                     Err(_) => break,
                     _ => {}
                 }
             }
-            eprintln!("C. quick-xml 纯事件（无转换）     : {:.3}s  [events={}]", t0.elapsed().as_secs_f64(), events);
+            eprintln!(
+                "C. quick-xml 纯事件（无转换）     : {:.3}s  [events={}]",
+                t0.elapsed().as_secs_f64(),
+                events
+            );
         }
 
         // D. 用 quick-xml 解析到 <c> 级别，但不构建 Cell
@@ -633,7 +937,11 @@ mod bench_tests2 {
                     _ => {}
                 }
             }
-            eprintln!("D. quick-xml 到 <c> 标签（无Cell）: {:.3}s  [cells={}]", t0.elapsed().as_secs_f64(), cells);
+            eprintln!(
+                "D. quick-xml 到 <c> 标签（无Cell）: {:.3}s  [cells={}]",
+                t0.elapsed().as_secs_f64(),
+                cells
+            );
         }
 
         eprintln!("{}", sep);

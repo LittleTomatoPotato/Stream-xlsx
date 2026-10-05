@@ -1,6 +1,6 @@
 use crate::excel_types::{Cell, Data, Dimensions};
 use crate::utils::*;
-use crate::workbook::SharedStrings;
+use crate::workbook::{SharedStrings, XlsxWorkbook};
 use anyhow::{Result, anyhow};
 use bytes::{Bytes, BytesMut};
 use crossbeam_channel::bounded;
@@ -38,7 +38,7 @@ impl FastConfig {
             .map(|n| n.get())
             .unwrap_or(8);
         Self {
-            parallelism: (cores / 2).min(8),
+            parallelism: (cores / 2).clamp(1, 8),
             chunk_size: 1000,
             queue_cap_mul: 1,
             temp_size: 1024 * 1024,
@@ -77,10 +77,47 @@ impl SheetFastReader {
         sheet_idx: Option<usize>,
         config: Option<&FastConfig>,
     ) -> Result<Self> {
+        let workbook = Arc::new(XlsxWorkbook::open_fast(path)?);
+        Self::from_workbook(workbook, sheet_name, sheet_idx, config)
+    }
+
+    /// 从已有工作簿启动 fast sheet reader。
+    ///
+    /// 多 sheet 切换时复用已初始化的 sharedStrings/styles，避免重复解压；sheet XML
+    /// 仍由有限容量 channel 分块流式扫描。
+    pub fn from_workbook(
+        workbook: Arc<XlsxWorkbook>,
+        sheet_name: Option<&str>,
+        sheet_idx: Option<usize>,
+        config: Option<&FastConfig>,
+    ) -> Result<Self> {
+        Self::from_workbook_with_numeric_lexemes(workbook, sheet_name, sheet_idx, config, false)
+    }
+
+    /// 固定 Schema 读取按需保留原始数值词法；普通 fast 模式避免额外分配。
+    pub(crate) fn from_workbook_with_numeric_lexemes(
+        workbook: Arc<XlsxWorkbook>,
+        sheet_name: Option<&str>,
+        sheet_idx: Option<usize>,
+        config: Option<&FastConfig>,
+        preserve_numeric_lexemes: bool,
+    ) -> Result<Self> {
         let default_cfg = FastConfig::default();
         let config = config.unwrap_or(&default_cfg);
-        let workbook = crate::workbook::XlsxWorkbook::open_fast(path)?;
+        if config.parallelism == 0 {
+            return Err(anyhow!("FastConfig.parallelism 必须大于 0"));
+        }
+        if config.chunk_size == 0 {
+            return Err(anyhow!("FastConfig.chunk_size 必须大于 0"));
+        }
+        if config.temp_size == 0 {
+            return Err(anyhow!("FastConfig.temp_size 必须大于 0"));
+        }
+        if config.buf_size == 0 {
+            return Err(anyhow!("FastConfig.buf_size 必须大于 0"));
+        }
         workbook.init()?;
+        let path = workbook.path();
         let sheet_path = match (sheet_name, sheet_idx) {
             (Some(name), _) => workbook
                 .sheet_path_by_name(name)
@@ -324,7 +361,7 @@ impl SheetFastReader {
                 while let Ok(chunk) = task_rx2.recv() {
                     let mut batch = Vec::with_capacity(chunk.len());
                     for (seq, raw) in chunk {
-                        let cell = parse_cell_fragment(&raw, seq)
+                        let cell = parse_cell_fragment(&raw, seq, preserve_numeric_lexemes)
                             .unwrap_or_else(|_| Cell::new((0, 0), Data::Empty));
                         batch.push((seq, cell));
                     }
@@ -449,7 +486,11 @@ fn parse_dimensions(xml: &[u8]) -> Result<Dimensions> {
 // Cell fragment parser — zero-copy, no heap allocation in hot path
 // ------------------------------------------------------------------
 
-fn parse_cell_fragment(raw: &[u8], _idx: usize) -> Result<Cell<Data>> {
+fn parse_cell_fragment(
+    raw: &[u8],
+    _idx: usize,
+    preserve_numeric_lexemes: bool,
+) -> Result<Cell<Data>> {
     let pos = extract_r_attr(raw)?;
     let t_attr = extract_t_attr(raw);
 
@@ -458,6 +499,7 @@ fn parse_cell_fragment(raw: &[u8], _idx: usize) -> Result<Cell<Data>> {
     }
 
     if let Some(val) = extract_v_value(raw) {
+        let mut raw_numeric_lexeme = None;
         let data = match t_attr {
             Some(b"s") => {
                 if let Ok(idx) = atoi_simd::parse::<usize, true, true>(val) {
@@ -472,6 +514,10 @@ fn parse_cell_fragment(raw: &[u8], _idx: usize) -> Result<Cell<Data>> {
                 let s = unsafe { std::str::from_utf8_unchecked(val) };
                 Data::String(PlSmallStr::from_str(s))
             }
+            Some(b"d") => {
+                let s = unsafe { std::str::from_utf8_unchecked(val) };
+                Data::DateTimeIso(PlSmallStr::from_str(s))
+            }
             Some(b"e") => {
                 let s = unsafe { std::str::from_utf8_unchecked(val) };
                 Data::Error(
@@ -480,17 +526,30 @@ fn parse_cell_fragment(raw: &[u8], _idx: usize) -> Result<Cell<Data>> {
                 )
             }
             _ => match atoi_simd::parse::<i64, true, true>(val) {
-                Ok(v) => Data::Int(v),
+                Ok(v) => {
+                    if preserve_numeric_lexemes && (t_attr.is_none() || t_attr == Some(b"n")) {
+                        raw_numeric_lexeme =
+                            Some(unsafe { std::str::from_utf8_unchecked(val) }.into());
+                    }
+                    Data::Int(v)
+                }
                 Err(_) => {
                     let s = unsafe { std::str::from_utf8_unchecked(val) };
                     match fast_float::parse::<f64, _>(s) {
-                        Ok(v) => Data::Float(v),
+                        Ok(v) => {
+                            if preserve_numeric_lexemes
+                                && (t_attr.is_none() || t_attr == Some(b"n"))
+                            {
+                                raw_numeric_lexeme = Some(s.into());
+                            }
+                            Data::Float(v)
+                        }
                         Err(_) => Data::String(PlSmallStr::from_str(s)),
                     }
                 }
             },
         };
-        return Ok(Cell::new(pos, data));
+        return Ok(Cell::with_raw_numeric_lexeme(pos, data, raw_numeric_lexeme));
     }
 
     if let Some(text) = extract_inline_text(raw) {
@@ -566,6 +625,57 @@ mod tests {
     use std::time::Instant;
 
     const TEST_FILE: &str = "../test_100w_60c.xlsx";
+
+    #[test]
+    fn fast_parser_preserves_untyped_numeric_lexemes() {
+        let integer = parse_cell_fragment(b"<c r=\"A1\"><v>00123</v></c>", 0, true).unwrap();
+        assert_eq!(integer.get_value(), &Data::Int(123));
+        assert_eq!(integer.raw_numeric_lexeme(), Some("00123"));
+        let same_value = parse_cell_fragment(b"<c r=\"A1\"><v>123</v></c>", 0, true).unwrap();
+        assert_eq!(integer, same_value);
+        assert_eq!(
+            parse_cell_fragment(b"<c r=\"A1\"><v>00123</v></c>", 0, false)
+                .unwrap()
+                .raw_numeric_lexeme(),
+            None
+        );
+
+        let decimal = parse_cell_fragment(b"<c r=\"A2\"><v>12.3400</v></c>", 0, true).unwrap();
+        assert_eq!(decimal.get_value(), &Data::Float(12.34));
+        assert_eq!(decimal.raw_numeric_lexeme(), Some("12.3400"));
+
+        let scientific = parse_cell_fragment(b"<c r=\"A3\"><v>1.25E+03</v></c>", 0, true).unwrap();
+        assert_eq!(scientific.get_value(), &Data::Float(1250.0));
+        assert_eq!(scientific.raw_numeric_lexeme(), Some("1.25E+03"));
+
+        let explicit_numeric =
+            parse_cell_fragment(b"<c r=\"A3\" t=\"n\"><v>2.500</v></c>", 0, true).unwrap();
+        assert_eq!(explicit_numeric.raw_numeric_lexeme(), Some("2.500"));
+
+        let text = parse_cell_fragment(b"<c r=\"A4\" t=\"str\"><v>00123</v></c>", 0, true).unwrap();
+        assert_eq!(
+            text.get_value(),
+            &Data::String(PlSmallStr::from_str("00123"))
+        );
+        assert_eq!(text.raw_numeric_lexeme(), None);
+
+        let non_numeric_lexemes: [&[u8]; 6] = [
+            b"<c r=\"A5\" t=\"s\"><v>123</v></c>",
+            b"<c r=\"A6\" t=\"b\"><v>1</v></c>",
+            b"<c r=\"A7\" t=\"e\"><v>#N/A</v></c>",
+            b"<c r=\"A8\" t=\"d\"><v>2026-01-01</v></c>",
+            b"<c r=\"A9\" t=\"inlineStr\"><is><t>00123</t></is></c>",
+            b"<c r=\"A10\" />",
+        ];
+        for raw in non_numeric_lexemes {
+            assert_eq!(
+                parse_cell_fragment(raw, 0, true)
+                    .unwrap()
+                    .raw_numeric_lexeme(),
+                None
+            );
+        }
+    }
 
     #[test]
     fn profile_sheet_fast() {

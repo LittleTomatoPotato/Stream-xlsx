@@ -1,4 +1,4 @@
-from typing import Iterator, Optional
+from typing import Iterator, Mapping, Optional
 
 import polars as pl
 
@@ -39,6 +39,7 @@ def read_xlsx(
     skip_rows: Optional[list[int]] = None,
     fast: bool = False,
     fast_parallelism: Optional[int] = None,
+    schema: Optional[Mapping[str, pl.DataType]] = None,
 ) -> XlsxReader:
     """打开 xlsx 文件，返回惰性迭代器。
 
@@ -50,7 +51,9 @@ def read_xlsx(
         has_header: 是否将第一行作为表头，默认 True。
         skip_rows: 需要跳过的 0-based 行索引列表（可选，不影响 header 解析）。
         fast: 是否使用 fast 并发解析模式（~3x 加速，多 ~30% 内存），默认 False。
-        fast_parallelism: fast 模式 worker 线程数（可选，默认自动；若超过机器核心数会自动减 2）。
+        fast_parallelism: fast 模式 worker 线程数（可选，默认自动；不会超过机器核心数）。
+        schema: 固定 Polars Schema。传入后严格校验表头和每个非空值的类型；
+            表头顺序可变化，输出始终使用 schema 顺序。
 
     返回:
         XlsxReader: 可迭代的 DataFrame 生成器，支持多 sheet 切换。

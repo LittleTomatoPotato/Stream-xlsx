@@ -1,6 +1,6 @@
 use crate::excel_types::{CellErrorType, Data, Dimensions};
-use polars::datatypes::PlSmallStr;
 use anyhow::{Result, anyhow};
+use polars::datatypes::PlSmallStr;
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 use std::collections::{HashMap, HashSet};
@@ -66,15 +66,26 @@ pub fn parse_a1(s: &[u8]) -> Result<(u32, u32)> {
     let mut i = 0;
     let mut col = 0u32;
     while i < s.len() && s[i].is_ascii_alphabetic() {
-        col = col * 26 + ((s[i].to_ascii_uppercase() - b'A' + 1) as u32);
+        col = col
+            .checked_mul(26)
+            .and_then(|value| value.checked_add(u32::from(s[i].to_ascii_uppercase() - b'A' + 1)))
+            .filter(|value| *value <= 16_384)
+            .ok_or_else(|| anyhow!("单元格列坐标超过 Excel 上限"))?;
         i += 1;
     }
     let mut row = 0u32;
     while i < s.len() && s[i].is_ascii_digit() {
-        row = row * 10 + ((s[i] - b'0') as u32);
+        row = row
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(u32::from(s[i] - b'0')))
+            .filter(|value| *value <= 1_048_576)
+            .ok_or_else(|| anyhow!("单元格行坐标超过 Excel 上限"))?;
         i += 1;
     }
-    Ok((row.saturating_sub(1), col.saturating_sub(1)))
+    if i != s.len() || row == 0 || col == 0 {
+        return Err(anyhow!("单元格引用必须包含有效的列字母和正整数行号"));
+    }
+    Ok((row - 1, col - 1))
 }
 
 pub fn parse_dimension(ref_attr: &[u8]) -> Result<Dimensions> {
@@ -88,6 +99,9 @@ pub fn parse_dimension(ref_attr: &[u8]) -> Result<Dimensions> {
     } else if parts.len() == 2 {
         let (start_row, start_col) = parse_a1(parts[0])?;
         let (end_row, end_col) = parse_a1(parts[1])?;
+        if start_row > end_row || start_col > end_col {
+            return Err(anyhow!("工作表 dimension 起点不能大于终点"));
+        }
         Ok(Dimensions {
             start: (start_row, start_col),
             end: (end_row, end_col),
@@ -97,6 +111,32 @@ pub fn parse_dimension(ref_attr: &[u8]) -> Result<Dimensions> {
             "Invalid dimension: {}",
             String::from_utf8_lossy(ref_attr)
         ))
+    }
+}
+
+#[cfg(test)]
+mod coordinate_bounds_tests {
+    use super::{parse_a1, parse_dimension};
+
+    #[test]
+    fn excel_coordinates_are_bounded_and_consume_the_entire_reference() {
+        assert_eq!(parse_a1(b"A1").unwrap(), (0, 0));
+        assert_eq!(parse_a1(b"a1").unwrap(), (0, 0));
+        assert_eq!(parse_a1(b"XFD1048576").unwrap(), (1_048_575, 16_383));
+        for reference in [
+            b"".as_slice(),
+            b"A0",
+            b"0",
+            b"A",
+            b"A1x",
+            b"XFE1",
+            b"A1048577",
+            b"AAAAAAAAAAAA1",
+            b"A999999999999999999999",
+        ] {
+            assert!(parse_a1(reference).is_err(), "{reference:?}");
+        }
+        assert!(parse_dimension(b"B2:A1").is_err());
     }
 }
 
@@ -165,14 +205,12 @@ pub fn parse_raw_value(text: &str, t_attr: Option<&str>) -> Result<Data> {
         }
         Some("str") => Ok(Data::String(PlSmallStr::from_str(text))),
         Some("d") => Ok(Data::DateTimeIso(PlSmallStr::from_str(text))),
-        _ => {
-            match atoi_simd::parse::<i64, true, true>(text.as_bytes()) {
-                Ok(v) => Ok(Data::Int(v)),
-                Err(_) => match fast_float::parse::<f64, _>(text) {
-                    Ok(v) => Ok(Data::Float(v)),
-                    Err(_) => Ok(Data::String(PlSmallStr::from_str(text))),
-                },
-            }
-        }
+        _ => match atoi_simd::parse::<i64, true, true>(text.as_bytes()) {
+            Ok(v) => Ok(Data::Int(v)),
+            Err(_) => match fast_float::parse::<f64, _>(text) {
+                Ok(v) => Ok(Data::Float(v)),
+                Err(_) => Ok(Data::String(PlSmallStr::from_str(text))),
+            },
+        },
     }
 }

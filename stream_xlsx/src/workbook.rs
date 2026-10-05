@@ -51,6 +51,8 @@ pub struct XlsxWorkbook {
     cell_xfs: OnceLock<Arc<Vec<u32>>>,
     custom_date_numfmts: OnceLock<Arc<HashSet<u32>>>,
     sheets: OrderdSheets,
+    /// Excel 工作簿是否使用 1904 日期系统。
+    is_1904: bool,
     /// If true, decompress sharedStrings.xml fully into memory and parse with
     /// a byte scanner (~5× faster, ~+2-4GB peak memory).
     fast_shared_strings: bool,
@@ -60,24 +62,38 @@ impl XlsxWorkbook {
     /// Open workbook in low-memory mode (default).
     /// sharedStrings.xml is parsed streaming via quick-xml.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Self::open_with_mode(path, false)
+        Self::open_with_mode(path, false, true)
     }
 
     /// Open workbook in fast mode.
     /// sharedStrings.xml is fully decompressed then byte-scanned.
     pub fn open_fast<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Self::open_with_mode(path, true)
+        Self::open_with_mode(path, true, true)
     }
 
-    fn open_with_mode<P: AsRef<Path>>(path: P, fast_shared_strings: bool) -> Result<Self> {
+    /// Open a workbook after the caller has verified its XLSX media type.
+    ///
+    /// This skips extension validation for uploads saved under names such as `.bin`, while still
+    /// requiring a readable ZIP archive containing the XLSX workbook structure.
+    pub fn open_with_verified_xlsx_media_type<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::open_with_mode(path, false, false)
+    }
+
+    fn open_with_mode<P: AsRef<Path>>(
+        path: P,
+        fast_shared_strings: bool,
+        validate_extension: bool,
+    ) -> Result<Self> {
         let path = path.as_ref().to_owned();
-        validate_workbook_extension(&path)?;
+        if validate_extension {
+            validate_workbook_extension(&path)?;
+        }
         let file = std::fs::File::open(&path)?;
         let reader = BufReader::new(file);
         let mut archive = ZipArchive::new(reader)?;
 
         let rels = Self::read_rels(&mut archive)?;
-        let sheets = Self::read_workbook_sheets(&mut archive, &rels)?;
+        let (sheets, is_1904) = Self::read_workbook_sheets(&mut archive, &rels)?;
 
         Ok(Self {
             path,
@@ -85,6 +101,7 @@ impl XlsxWorkbook {
             cell_xfs: OnceLock::new(),
             custom_date_numfmts: OnceLock::new(),
             sheets,
+            is_1904,
             fast_shared_strings,
         })
     }
@@ -142,6 +159,10 @@ impl XlsxWorkbook {
 
     pub fn custom_date_numfmts(&self) -> Option<&Arc<HashSet<u32>>> {
         self.custom_date_numfmts.get()
+    }
+
+    pub fn is_1904(&self) -> bool {
+        self.is_1904
     }
 
     pub fn sheet_count(&self) -> usize {
@@ -209,17 +230,28 @@ impl XlsxWorkbook {
     fn read_workbook_sheets<R: Read + Seek>(
         archive: &mut ZipArchive<R>,
         rels: &HashMap<String, String>,
-    ) -> Result<OrderdSheets> {
+    ) -> Result<(OrderdSheets, bool)> {
         let file = archive
             .by_name("xl/workbook.xml")
             .context("workbook.xml not found")?;
         let mut reader = Reader::from_reader(BufReader::with_capacity(64 * 1024, file));
         let mut buf = Vec::new();
         let mut sheets = OrderdSheets::new();
+        let mut is_1904 = false;
 
         loop {
             buf.clear();
             match reader.read_event_into(&mut buf) {
+                Ok(Event::Empty(e)) | Ok(Event::Start(e))
+                    if e.local_name().as_ref() == b"workbookPr" =>
+                {
+                    for attr in e.attributes() {
+                        let attr = attr?;
+                        if attr.key.local_name().as_ref() == b"date1904" {
+                            is_1904 = matches!(attr.value.as_ref(), b"1" | b"true" | b"TRUE");
+                        }
+                    }
+                }
                 Ok(Event::Empty(e)) | Ok(Event::Start(e))
                     if e.local_name().as_ref() == b"sheet" =>
                 {
@@ -247,7 +279,7 @@ impl XlsxWorkbook {
                 _ => {}
             }
         }
-        Ok(sheets)
+        Ok((sheets, is_1904))
     }
 
     fn read_shared_strings<R: Read + Seek>(
@@ -637,9 +669,20 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
     use std::io::BufReader;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
 
     const TEST_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../test_100w_60c.xlsx");
+    const SMALL_TEST_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../inlineStr_cdata.xlsx");
+
+    fn temporary_bin_path() -> PathBuf {
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+        std::env::temp_dir().join(format!(
+            "stream_xlsx_test_{}_{}.bin",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 
     #[test]
     fn validates_supported_workbook_extensions_case_insensitively() {
@@ -674,6 +717,40 @@ mod tests {
                 .to_string()
                 .contains(SUPPORTED_WORKBOOK_EXTENSIONS_DISPLAY)
         );
+    }
+
+    #[test]
+    fn verified_xlsx_media_type_open_accepts_valid_bin_file() {
+        let path = temporary_bin_path();
+        std::fs::copy(SMALL_TEST_FILE, &path).unwrap();
+
+        let workbook = XlsxWorkbook::open_with_verified_xlsx_media_type(&path);
+        let strict_open = XlsxWorkbook::open(&path);
+        std::fs::remove_file(&path).unwrap();
+
+        let workbook = workbook.unwrap();
+        assert_eq!(workbook.sheet_count(), 1);
+        assert!(
+            strict_open
+                .unwrap_err()
+                .to_string()
+                .contains(SUPPORTED_WORKBOOK_EXTENSIONS_DISPLAY)
+        );
+    }
+
+    #[test]
+    fn verified_xlsx_media_type_open_rejects_non_zip_and_truncated_zip() {
+        let non_zip_path = temporary_bin_path();
+        std::fs::write(&non_zip_path, b"not a ZIP archive").unwrap();
+        assert!(XlsxWorkbook::open_with_verified_xlsx_media_type(&non_zip_path).is_err());
+        std::fs::remove_file(&non_zip_path).unwrap();
+
+        let mut truncated_xlsx = std::fs::read(SMALL_TEST_FILE).unwrap();
+        truncated_xlsx.truncate(truncated_xlsx.len().saturating_sub(32));
+        let truncated_path = temporary_bin_path();
+        std::fs::write(&truncated_path, truncated_xlsx).unwrap();
+        assert!(XlsxWorkbook::open_with_verified_xlsx_media_type(&truncated_path).is_err());
+        std::fs::remove_file(&truncated_path).unwrap();
     }
 
     /// 精确测量 init() 每个子阶段的耗时，找出 4.2s 与 2.5s 的差距。

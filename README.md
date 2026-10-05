@@ -12,6 +12,7 @@
 - **多 sheet 支持**:打开后可查看所有 sheet 名称,按需切换,sharedStrings/styles 只解析一次
 - **惰性加载**:`open()` 仅解析 sheet 列表;`sharedStrings.xml` / `styles.xml` 在首次读取时才加载
 - **类型推断**:边读边推断列类型(Int → Float → String),空值不参与推断
+- **固定 Schema**:可跳过推断和类型升级；表头只映射一次，fast 模式直接写入原生列 builder
 - **skip_rows**:支持跳过指定 0-based 行索引,不影响 header 解析
 - **日期支持**:读取 `xl/styles.xml` 的 `cellXfs` + 自定义 `numFmt`,自动识别日期列
 - **Shell 补全**:内置 zsh / bash 自动补全生成
@@ -102,7 +103,95 @@ for df in reader:
 reader = sx.read_xlsx("data.xlsx", skip_rows=[1, 3, 5])
 for df in reader:
     print(df.shape)
+
+# 固定 Schema 严格读取；xlsx 物理列顺序可以变化，输出始终按 schema 顺序
+import polars as pl
+
+reader = sx.read_xlsx(
+    "data.xlsx",
+    fast=True,
+    schema={
+        "id": pl.Int64,
+        "amount": pl.Float64,
+        "created_at": pl.Datetime("us"),
+    },
+)
+for df in reader:
+    # 任一非空值与声明类型不兼容时，此处立即抛出异常并终止迭代
+    print(df.schema)
 ```
+
+### Rust 固定 Schema API
+
+`df_iter_with_schema` 和 `df_iter_fast_with_schema` 用于严格读取。两者仍按 batch
+流式产出，不会缓存整张工作表；fast 版本只在首行按名称建立一次列映射，随后逐
+单元格通过数组索引写入预分配 builder，不执行字段名查询、类型推断、类型升级或
+`AnyValue` 回退。
+
+```rust
+use polars::prelude::*;
+use std::sync::Arc;
+use stream_xlsx::df_iter_fast_with_schema;
+
+let schema: SchemaRef = Arc::new(
+    [
+        ("id".into(), DataType::Int64),
+        ("amount".into(), DataType::Float64),
+        (
+            "created_at".into(),
+            DataType::Datetime(TimeUnit::Microseconds, None),
+        ),
+    ]
+    .into_iter()
+    .collect(),
+);
+let batches = df_iter_fast_with_schema(
+    Some(10_000), "input.xlsx", None, Some(0), true, None, schema, None,
+)?;
+```
+
+严格模式要求表头字段集合与 Schema 完全一致，允许表头顺序变化；无表头时按位置
+对应。当前 Rust 固定 Schema 原生快路径支持 `Int64`、`Float64`、`Decimal`、`Boolean`、`String`、`Date`、无时区
+`Datetime` 和 `Null`。空单元格作为 null；`Int64 → Float64` 是唯一数值扩宽；Excel
+日期数值会按工作簿的 1900/1904 日期系统转换。其他不兼容值会携带 sheet、字段和
+单元格坐标返回错误。
+
+严格校验是流式发生的，错误可能出现在后续 batch。ETL 若要求“全部校验成功后再
+执行”，应先完整消费迭代器并写入临时 Parquet，再提交后续转换或目标表写入。
+
+### Rust 多级合并表头计划
+
+`inspect_header_plan` 会完整消费选中 Sheet XML（`mergeCells` 通常在数据之后），但只保存表头标签和相关合并范围，
+不缓存数据行。顶部物理跳过行数和 1～8 层表头由调用方明确指定，默认精确比较原始标签：
+
+```rust
+use stream_xlsx::{inspect_header_plan, HeaderInspectOptions, XlsxHeaderPath, StrictDataFrameIter};
+use stream_xlsx::workbook::XlsxWorkbook;
+
+let workbook = Arc::new(XlsxWorkbook::open("input.xlsx")?);
+let header = inspect_header_plan(
+    Arc::clone(&workbook), Some("Sheet1"), None,
+    HeaderInspectOptions { header_depth: 2, ..Default::default() },
+)?;
+let bound = header.bind_fields(&[
+    ("sales_online".into(), XlsxHeaderPath(vec!["销售".into(), "线上".into()])),
+    ("sales_retail".into(), XlsxHeaderPath(vec!["销售".into(), "门店".into()])),
+])?;
+// schema 的字段名必须恰好对应上面的正式名称，输出按 schema 顺序。
+let batches = StrictDataFrameIter::from_workbook_with_header_plan(
+    Some(8192), Arc::clone(&workbook), &bound, schema, None, true, None,
+)?;
+```
+
+只有真实合并范围才传播左上角标签；同一个纵向合并标签只记录一次，非合并重复文本仍保留独立层级。
+标签里的 `.` 不会被拆分。表头跨入数据区、合并重叠、重复路径和不完整字段绑定都会报错。
+横向越界默认 `HeaderMergeOverflow::Error`，显式 `ClipAndWarn` 会裁剪并返回结构警告；最深表头的非空列决定
+右边界，dimension/格式空格不会扩大它。没有可用边界的空表可由 `accepted_column_count` 提供已确认的列数。
+范围外格式空格不扩大严格输出列，真实非空数据则返回 `SchemaMismatch::ColumnOutsideHeader`。
+
+`inspect_sheet_schema_with_header_plan` 可复用同一绑定计划全 Sheet 扫描实际类型，不接收 AcceptedSchema 类型，
+也不生成 DataFrame。计划限定同一个 `Arc<XlsxWorkbook>` 和 Sheet；切换 Sheet 必须重新检查和绑定计划。
+调用方负责保证工作簿文件在检查及复读期间不可变。名称归一化、Parquet 暂存和漂移放行策略仍由上层明确处理。
 
 ## Benchmark
 
@@ -320,11 +409,10 @@ worker 池能贡献的上限,继续堆 worker 不再变快),说明瓶颈不在 w
 
 ## 局限性与已知问题
 
-### 标题行仅支持单行
+### 便捷接口和 Python 表头仍为单行
 
-`has_header=True` 时,只把**第一行**作为列名。多级表头(例如合并单元格跨越两行形成"分类 + 字段"两层结构)目前**不支持**——会被当成数据行处理,导致第一行表头被合并到字符串列里。`skip_rows` 参数用于跳过数据行,对多级表头无帮助。
-
-如需处理多级表头,可在读取后用 Polars 自行重塑列名,或预处理 xlsx 把多级表头合并为一行。
+原有便捷接口与 Python `has_header=True` 保持单行行为，不会自动识别多级标题；`skip_rows` 只跳过数据行。
+Rust 调用方可使用上面的显式表头计划 API，当前 Python 尚未暴露它。
 
 ### fast 模式共享字符串解析是简化版
 

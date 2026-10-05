@@ -5,11 +5,11 @@ resolver = "2"
 
 [package]
 name = "sxlsx"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2024"
 
 [dependencies]
-polars = { version = "0.53.0", features = ["csv", "parquet"] }
+polars = { version = "0.55.2", default-features = false, features = ["csv", "parquet", "dtype-date", "dtype-datetime", "dtype-decimal", "temporal"] }
 rust_xlsxwriter = "0.84"
 rand = "0.9"
 anyhow = "1.0.102"

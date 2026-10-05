@@ -4,10 +4,12 @@ use std::str::FromStr;
 use polars::datatypes::PlSmallStr;
 
 /// 单元格坐标与值（完全独立，不依赖 calamine）
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Cell<T> {
     pos: (u32, u32),
     val: T,
+    // 仅供需要精确解释 XLSX 数值的路径使用；不改变既有 Cell 的值语义。
+    raw_numeric_lexeme: Option<Box<str>>,
 }
 
 impl<T> Cell<T> {
@@ -15,7 +17,26 @@ impl<T> Cell<T> {
         Self {
             pos: position,
             val: value,
+            raw_numeric_lexeme: None,
         }
+    }
+
+    pub(crate) fn with_raw_numeric_lexeme(
+        position: (u32, u32),
+        value: T,
+        raw_numeric_lexeme: Option<Box<str>>,
+    ) -> Self {
+        Self {
+            pos: position,
+            val: value,
+            raw_numeric_lexeme,
+        }
+    }
+
+    /// 数值单元格 `<v>` 的原始文本，包含用数值序号表示的原生日期。
+    /// 文本、布尔、ISO 文本日期与空单元格返回 None；须在读取器中显式开启保留。
+    pub fn raw_numeric_lexeme(&self) -> Option<&str> {
+        self.raw_numeric_lexeme.as_deref()
     }
     pub fn get_position(&self) -> (u32, u32) {
         self.pos
@@ -25,6 +46,12 @@ impl<T> Cell<T> {
     }
     pub fn into_value(self) -> T {
         self.val
+    }
+}
+
+impl<T: PartialEq> PartialEq for Cell<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.pos == other.pos && self.val == other.val
     }
 }
 
@@ -156,6 +183,43 @@ impl ExcelDateTime {
         self.value
     }
 
+    /// 无时间部分的 Excel 日期转换为 Unix epoch 起算的天数。
+    /// 非有限值、非零时间部分或超出 Polars Date 的 i32 范围时返回 None。
+    pub fn try_to_unix_date_days(&self) -> Option<i32> {
+        if self.value.fract() != 0.0 {
+            return None;
+        }
+        i32::try_from(self.checked_unix_days()?).ok()
+    }
+
+    /// 检查范围后返回毫秒时间戳，沿用库现有“小数天舍入为毫秒”的日期解码语义。
+    /// 不经过纳秒中转，因此较远的日期仍可使用毫秒/微秒存储；调用方负责目标单位检查。
+    pub fn try_to_timestamp_millis(&self) -> Option<i64> {
+        let unix_days = self.checked_unix_days()?;
+        let fraction = self.value - self.value.floor();
+        let time_millis = (fraction * 86_400_000.0).round() as i128;
+        let timestamp = i128::from(unix_days) * 86_400_000 + time_millis;
+        i64::try_from(timestamp).ok()
+    }
+
+    fn checked_unix_days(&self) -> Option<i64> {
+        let days = self.value.floor();
+        if !days.is_finite() || days < i64::MIN as f64 || days >= -(i64::MIN as f64) {
+            return None;
+        }
+        let days = days as i64;
+        let offset = if self.is_1904 {
+            24_107
+        } else if (1..=60).contains(&days) {
+            // 保留现有时间戳兼容映射：序号 60 与 61 都映为 1900-03-01，
+            // 而不是构造 Gregorian/Polars 无法表示的 1900-02-29。
+            25_568
+        } else {
+            25_569
+        };
+        days.checked_sub(offset)
+    }
+
     /// 直接返回纳秒时间戳（跳过 chrono 双重校验）
     ///
     /// Excel 1900 calendar 伪 epoch 为 1899-12-30（兼容 1900 闰年 bug）。
@@ -168,7 +232,7 @@ impl ExcelDateTime {
 
         // 计算自 Unix epoch (1970-01-01) 以来的天数
         let unix_days = if self.is_1904 {
-            days + 24_107 // 1904-01-01 → 1970-01-01 = 24107 天
+            days - 24_107 // 1904-01-01 → 1970-01-01 = 24107 天
         } else if days > 60 {
             days - 25_569 // 1899-12-30 → 1970-01-01 = 25569 天
         } else if days >= 1 {
@@ -177,7 +241,7 @@ impl ExcelDateTime {
             days - 25_569
         };
 
-        // 时间部分：毫秒精度已足够（Excel 只存到毫秒）
+        // 沿用当前库的毫秒日期解码语义；这不是 XLSX 格式的精度上限。
         let time_millis = (fract * 86_400_000f64).round() as i64;
 
         unix_days * NANOS_PER_DAY + time_millis * 1_000_000
@@ -308,4 +372,98 @@ impl fmt::Display for ExcelDateTime {
 pub struct Dimensions {
     pub start: (u32, u32),
     pub end: (u32, u32),
+}
+
+#[cfg(test)]
+mod checked_temporal_tests {
+    use super::ExcelDateTime;
+
+    #[test]
+    fn checked_temporal_uses_each_workbook_calendar() {
+        assert_eq!(
+            ExcelDateTime::new(25_569.0, false).try_to_unix_date_days(),
+            Some(0)
+        );
+        assert_eq!(
+            ExcelDateTime::new(24_107.0, true).try_to_unix_date_days(),
+            Some(0)
+        );
+        assert_eq!(
+            ExcelDateTime::new(0.0, true).try_to_unix_date_days(),
+            Some(-24_107)
+        );
+        assert_eq!(
+            ExcelDateTime::new(0.0, true).try_to_timestamp_millis(),
+            Some(-2_082_844_800_000)
+        );
+        assert_eq!(
+            ExcelDateTime::new(0.0, true).to_timestamp_nanos(),
+            -2_082_844_800_000_000_000
+        );
+        assert_eq!(
+            ExcelDateTime::new(59.0, false).try_to_unix_date_days(),
+            Some(-25_509)
+        );
+        assert_eq!(
+            ExcelDateTime::new(60.0, false).try_to_unix_date_days(),
+            Some(-25_508)
+        );
+        assert_eq!(
+            ExcelDateTime::new(61.0, false).try_to_unix_date_days(),
+            Some(-25_508)
+        );
+    }
+
+    #[test]
+    fn checked_date_does_not_truncate_nonzero_time() {
+        assert_eq!(
+            ExcelDateTime::new(25_569.5, false).try_to_unix_date_days(),
+            None
+        );
+        assert_eq!(
+            ExcelDateTime::new(25_569.000000001, false).try_to_unix_date_days(),
+            None
+        );
+        assert_eq!(
+            ExcelDateTime::new(-0.5, false).try_to_unix_date_days(),
+            None
+        );
+    }
+
+    #[test]
+    fn checked_millis_keeps_existing_native_decode_and_handles_far_dates() {
+        assert_eq!(
+            ExcelDateTime::new(25_569.5, false).try_to_timestamp_millis(),
+            Some(43_200_000)
+        );
+        assert_eq!(
+            ExcelDateTime::new(25_569.0 + 1.0 / 86_400_000.0, false).try_to_timestamp_millis(),
+            Some(1)
+        );
+        assert_eq!(
+            ExcelDateTime::new(2_958_465.0, false).try_to_timestamp_millis(),
+            Some(253_402_214_400_000)
+        );
+        assert_eq!(
+            ExcelDateTime::new(2_958_465.0, false).try_to_unix_date_days(),
+            Some(2_932_896)
+        );
+    }
+
+    #[test]
+    fn checked_temporal_nonfinite_and_overflow_return_none_without_panicking() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1e300, -1e300] {
+            let date = ExcelDateTime::new(value, false);
+            assert_eq!(date.try_to_unix_date_days(), None);
+            assert_eq!(date.try_to_timestamp_millis(), None);
+        }
+        assert_eq!(
+            ExcelDateTime::new(3_000_000_000.0, false).try_to_unix_date_days(),
+            None
+        );
+        assert_eq!(
+            ExcelDateTime::new(200_000_000_000.0, false).try_to_timestamp_millis(),
+            None
+        );
+    }
 }

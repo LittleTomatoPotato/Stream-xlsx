@@ -1,13 +1,13 @@
 [package]
 name = "stream_xlsx"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
-polars = "0.53.0"
-polars-arrow = "0.53.0"
-polars-buffer = "0.53.0"
+polars = { version = "0.55.2", default-features = false, features = ["dtype-date", "dtype-datetime", "dtype-decimal", "temporal"] }
+polars-arrow = "0.55.2"
+polars-buffer = "0.55.2"
 quick-xml = "0.39"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }

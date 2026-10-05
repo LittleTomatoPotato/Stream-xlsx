@@ -1,6 +1,6 @@
 [package]
 name = "stream_xlsx_py"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2024"
 
 [lib]
@@ -8,8 +8,10 @@ crate-type = ["cdylib"]
 
 [dependencies]
 stream_xlsx = { path = "../stream_xlsx" }
-pyo3 = { version = "0.27", features = ["extension-module", "abi3-py39", "generate-import-lib"] }
-pyo3-polars = "0.26"
+anyhow = "1.0.102"
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py39", "generate-import-lib"] }
+pyo3-polars = "0.28"
+polars = "0.55.2"
 
 [package.metadata.maturin]
 module-name = "stream_xlsx_py"

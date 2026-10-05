@@ -20,7 +20,10 @@ mod tests {
         let reader = BufReader::new(file);
         let mut archive = zip::ZipArchive::new(reader).unwrap();
 
-        eprintln!("{:<40} {:>12} {:>12} {:>8}", "Name", "Compressed", "Uncompressed", "Ratio");
+        eprintln!(
+            "{:<40} {:>12} {:>12} {:>8}",
+            "Name", "Compressed", "Uncompressed", "Ratio"
+        );
         eprintln!("{}", iter::repeat('-').take(80).collect::<String>());
         let mut total_compressed = 0u64;
         let mut total_uncompressed = 0u64;
@@ -44,13 +47,19 @@ mod tests {
         eprintln!("{}", iter::repeat('-').take(80).collect::<String>());
         eprintln!(
             "{:<40} {:>12} {:>12} {:>7.2}x",
-            "TOTAL", human_size(total_compressed), human_size(total_uncompressed),
+            "TOTAL",
+            human_size(total_compressed),
+            human_size(total_uncompressed),
             total_uncompressed as f64 / total_compressed.max(1) as f64
         );
     }
 
     /// 解压指定条目 N 次，测量吞吐率。
-    fn bench_entry(archive: &mut zip::ZipArchive<BufReader<std::fs::File>>, idx: usize, iterations: usize) -> f64 {
+    fn bench_entry(
+        archive: &mut zip::ZipArchive<BufReader<std::fs::File>>,
+        idx: usize,
+        iterations: usize,
+    ) -> f64 {
         // 预热
         {
             let mut zf = archive.by_index(idx).unwrap();
@@ -70,7 +79,9 @@ mod tests {
             let mut buf = vec![0u8; BUF_SIZE];
             loop {
                 let n = zf.read(&mut buf).unwrap();
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 total += n as u64;
             }
         }
@@ -98,7 +109,9 @@ mod tests {
             let mut buf = vec![0u8; BUF_SIZE];
             loop {
                 let n = zf.read(&mut buf).unwrap();
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
             }
         }
         let elapsed = start.elapsed().as_secs_f64();
@@ -130,7 +143,9 @@ mod tests {
             let init_elapsed = t1.elapsed().as_secs_f64();
             eprintln!(
                 "低内存模式 : open {:.3}s + init {:.3}s = {:.3}s",
-                open_elapsed, init_elapsed, open_elapsed + init_elapsed
+                open_elapsed,
+                init_elapsed,
+                open_elapsed + init_elapsed
             );
         }
 
@@ -144,7 +159,9 @@ mod tests {
             let init_elapsed = t1.elapsed().as_secs_f64();
             eprintln!(
                 "激进模式   : open {:.3}s + init {:.3}s = {:.3}s",
-                open_elapsed, init_elapsed, open_elapsed + init_elapsed
+                open_elapsed,
+                init_elapsed,
+                open_elapsed + init_elapsed
             );
         }
 
@@ -248,7 +265,11 @@ mod tests {
         if offsets.len() > 0 && offsets.len() == offsets2.len() {
             eprintln!("✅ 两种扫描方案解析的字符串数量一致");
         } else {
-            eprintln!("⚠️  字符串数量不一致: 简单={}, 增强={}", offsets.len(), offsets2.len());
+            eprintln!(
+                "⚠️  字符串数量不一致: 简单={}, 增强={}",
+                offsets.len(),
+                offsets2.len()
+            );
         }
     }
 
@@ -282,13 +303,19 @@ mod tests {
         let fast_time = t1.elapsed().as_secs_f64();
         let fast_strings = wb_fast.strings().unwrap();
         let fast_count = fast_strings.offsets.len();
-        eprintln!("激进模式  : {} 个字符串, 耗时 {:.3}s", fast_count, fast_time);
+        eprintln!(
+            "激进模式  : {} 个字符串, 耗时 {:.3}s",
+            fast_count, fast_time
+        );
 
         eprintln!("{}", sep);
 
         // 3. 验证一致性
         if low_count != fast_count {
-            eprintln!("❌ 字符串数量不一致: 低内存={}, 激进={}", low_count, fast_count);
+            eprintln!(
+                "❌ 字符串数量不一致: 低内存={}, 激进={}",
+                low_count, fast_count
+            );
             return;
         }
 
@@ -297,8 +324,10 @@ mod tests {
         for i in 0..max_check {
             let (l_start, l_len) = low_strings.offsets[i];
             let (f_start, f_len) = fast_strings.offsets[i];
-            let l_text = &low_strings.buffer.as_slice()[l_start as usize..(l_start + l_len) as usize];
-            let f_text = &fast_strings.buffer.as_slice()[f_start as usize..(f_start + f_len) as usize];
+            let l_text =
+                &low_strings.buffer.as_slice()[l_start as usize..(l_start + l_len) as usize];
+            let f_text =
+                &fast_strings.buffer.as_slice()[f_start as usize..(f_start + f_len) as usize];
             if l_text != f_text {
                 mismatches += 1;
                 if mismatches <= 3 {
@@ -319,16 +348,15 @@ mod tests {
         }
 
         if fast_count > 0 {
-            eprintln!(
-                "📈 加速比: {:.1}x",
-                low_time / fast_time
-            );
+            eprintln!("📈 加速比: {:.1}x", low_time / fast_time);
         }
         eprintln!("{}", sep);
     }
 
     fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-        haystack.windows(needle.len()).position(|window| window == needle)
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
     }
 
     /// 综合解压基准：分别测 sheet1.xml、sharedStrings.xml、全量解压。
@@ -372,7 +400,10 @@ mod tests {
             let thr = bench_entry(&mut archive, idx, 5);
             eprintln!(
                 "sheet1.xml   | 压缩 {:>10} → 解压 {:>10} | {:.2}x | 吞吐 {:.2} MB/s",
-                human_size(*c), human_size(*u), *u as f64 / (*c).max(1) as f64, thr
+                human_size(*c),
+                human_size(*u),
+                *u as f64 / (*c).max(1) as f64,
+                thr
             );
         }
 
@@ -381,12 +412,18 @@ mod tests {
             let thr = bench_entry(&mut archive, idx, 5);
             eprintln!(
                 "sharedStrings| 压缩 {:>10} → 解压 {:>10} | {:.2}x | 吞吐 {:.2} MB/s",
-                human_size(*c), human_size(*u), *u as f64 / (*c).max(1) as f64, thr
+                human_size(*c),
+                human_size(*u),
+                *u as f64 / (*c).max(1) as f64,
+                thr
             );
         }
 
         let thr = bench_all(&mut archive);
-        eprintln!("全量解压     | 所有条目                          | 吞吐 {:.2} MB/s", thr);
+        eprintln!(
+            "全量解压     | 所有条目                          | 吞吐 {:.2} MB/s",
+            thr
+        );
         eprintln!("{}", sep);
     }
 
@@ -401,4 +438,3 @@ mod tests {
         format!("{:.2} {}", size, UNITS[unit_idx])
     }
 }
-
